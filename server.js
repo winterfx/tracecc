@@ -5,6 +5,10 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { config } from 'dotenv';
+
+// Load environment variables from .env file
+config();
 
 const execAsync = promisify(exec);
 const __filename = fileURLToPath(import.meta.url);
@@ -12,6 +16,12 @@ const __dirname = path.dirname(__filename);
 
 const WEB_PORT = 3000;
 const PROXY_PORT = 8080;
+
+// UI default values from environment
+const UI_DEFAULTS = {
+  domain: process.env.UI_DEFAULT_DOMAIN || '',
+  bypassPaths: process.env.UI_DEFAULT_BYPASS_PATHS || ''
+};
 
 // Proxy state
 let proxyServer = null;
@@ -35,6 +45,14 @@ const webServer = http.createServer(async (req, res) => {
   }
 
   // API Routes
+  if (req.url === '/api/config' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      defaults: UI_DEFAULTS
+    }));
+    return;
+  }
+
   if (req.url === '/api/start' && req.method === 'POST') {
     let body = '';
     for await (const chunk of req) body += chunk;

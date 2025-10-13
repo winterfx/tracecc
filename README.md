@@ -8,13 +8,30 @@ AI API request tracing proxy with Web UI control and visual report generation.
 npm install
 ```
 
+## Configuration (Optional)
+
+To set default values for the UI (for privacy and convenience), create a `.env` file:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` with your preferred defaults:
+
+```env
+UI_DEFAULT_DOMAIN=https://api.example.com
+UI_DEFAULT_BYPASS_PATHS=/health,/metrics
+```
+
+**Important:** The `.env` file is git-ignored to protect your privacy. Never commit it to version control.
+
 ## Usage
 
 ```bash
 npm start
 ```
 
-Open `http://localhost:3000`, configure target domain and bypass paths, then start the proxy (listening on port 8080).
+Open `http://localhost:3000`, configure target domain and bypass paths (or use defaults from `.env`), then start the proxy (listening on port 8080).
 
 ### Web UI Workflow
 
@@ -23,14 +40,6 @@ Open `http://localhost:3000`, configure target domain and bypass paths, then sta
 3. Click [START] to launch proxy
 4. Configure your client to use proxy `http://localhost:8080`
 5. Click [STOP] to stop and generate HTML report
-
-### Direct Proxy Mode
-
-Modify `TARGET` and `BYPASS_PATHS` in `proxy.js`, then run:
-
-```bash
-npm run proxy
-```
 
 ## Log Format
 
