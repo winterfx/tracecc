@@ -5,11 +5,14 @@ package-lock.json
 # Logs
 *.log
 *.jsonl
-*.html
 requests.log
 
-# Public directory (build artifacts or temporary files)
-public/
+# HTML reports (but not source files)
+log-*.html
+
+# Public directory - track source files only
+public/*
+!public/index.html
 
 # Claude trace files
 .claude-trace/

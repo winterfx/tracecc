@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Proxy Controller - Retro Edition</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Press Start 2P', cursive;
+            background: #0f0f0f;
+            color: #00ff00;
+            min-height: 100vh;
+            padding: 20px;
+            background-image:
+                repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0, 255, 0, 0.03) 2px, rgba(0, 255, 0, 0.03) 4px);
+            animation: scanlines 8s linear infinite;
+        }
+
+        @keyframes scanlines {
+            0% { background-position: 0 0; }
+            100% { background-position: 0 100%; }
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            border: 4px solid #00ff00;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 30px;
+            box-shadow: 0 0 20px rgba(0, 255, 0, 0.5), inset 0 0 20px rgba(0, 255, 0, 0.1);
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 24px;
+            text-shadow: 0 0 10px #00ff00, 0 0 20px #00ff00;
+            animation: glow 2s ease-in-out infinite alternate;
+        }
+
+        @keyframes glow {
+            from { text-shadow: 0 0 5px #00ff00, 0 0 10px #00ff00; }
+            to { text-shadow: 0 0 10px #00ff00, 0 0 20px #00ff00, 0 0 30px #00ff00; }
+        }
+
+        .form-group {
+            margin-bottom: 25px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 10px;
+            font-size: 12px;
+            text-transform: uppercase;
+        }
+
+        input[type="text"] {
+            width: 100%;
+            padding: 12px;
+            background: #000;
+            border: 3px solid #00ff00;
+            color: #00ff00;
+            font-family: 'Press Start 2P', cursive;
+            font-size: 10px;
+            outline: none;
+            transition: all 0.3s;
+        }
+
+        input[type="text"]:focus {
+            box-shadow: 0 0 15px rgba(0, 255, 0, 0.6);
+            border-color: #00ff00;
+        }
+
+        input[type="text"]::placeholder {
+            color: #006600;
+        }
+
+        .button-group {
+            display: flex;
+            gap: 20px;
+            margin-top: 30px;
+            justify-content: center;
+        }
+
+        button {
+            font-family: 'Press Start 2P', cursive;
+            font-size: 12px;
+            padding: 15px 30px;
+            background: #000;
+            border: 3px solid #00ff00;
+            color: #00ff00;
+            cursor: pointer;
+            text-transform: uppercase;
+            transition: all 0.3s;
+            position: relative;
+            overflow: hidden;
+        }
+
+        button:hover {
+            background: #00ff00;
+            color: #000;
+            box-shadow: 0 0 20px rgba(0, 255, 0, 0.8);
+        }
+
+        button:active {
+            transform: scale(0.95);
+        }
+
+        button:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+
+        button:disabled:hover {
+            background: #000;
+            color: #00ff00;
+            box-shadow: none;
+        }
+
+        .status {
+            margin-top: 30px;
+            padding: 20px;
+            border: 3px solid #00ff00;
+            background: rgba(0, 255, 0, 0.05);
+            min-height: 100px;
+        }
+
+        .status-title {
+            font-size: 10px;
+            margin-bottom: 15px;
+            text-transform: uppercase;
+        }
+
+        .status-content {
+            font-size: 9px;
+            line-height: 1.8;
+            color: #00cc00;
+        }
+
+        .blink {
+            animation: blink 1s step-start infinite;
+        }
+
+        @keyframes blink {
+            50% { opacity: 0; }
+        }
+
+        .report-link {
+            margin-top: 20px;
+            padding: 15px;
+            border: 3px solid #ffff00;
+            background: rgba(255, 255, 0, 0.05);
+            text-align: center;
+        }
+
+        .report-link a {
+            color: #ffff00;
+            text-decoration: none;
+            font-size: 10px;
+            text-shadow: 0 0 10px #ffff00;
+        }
+
+        .report-link a:hover {
+            text-decoration: underline;
+            text-shadow: 0 0 20px #ffff00;
+        }
+
+        .pixel-border {
+            position: relative;
+        }
+
+        .pixel-border::before,
+        .pixel-border::after {
+            content: '';
+            position: absolute;
+            width: 10px;
+            height: 10px;
+            border: 2px solid #00ff00;
+        }
+
+        .pixel-border::before {
+            top: -2px;
+            left: -2px;
+        }
+
+        .pixel-border::after {
+            bottom: -2px;
+            right: -2px;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: #00ff00;
+            animation: loading 1s infinite;
+        }
+
+        @keyframes loading {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container pixel-border">
+        <h1>&gt; PROXY CONTROLLER &lt;</h1>
+
+        <div class="form-group">
+            <label for="domain">&gt; Target Domain:</label>
+            <input type="text" id="domain" placeholder="https://api.example.com" value="">
+        </div>
+
+        <div class="form-group">
+            <label for="bypass">&gt; Bypass Paths (comma separated):</label>
+            <input type="text" id="bypass" placeholder="/health, /metrics" value="">
+        </div>
+
+        <div class="button-group">
+            <button id="startBtn" onclick="startProxy()">
+                [ START ]
+            </button>
+            <button id="stopBtn" onclick="stopProxy()" disabled>
+                [ STOP ]
+            </button>
+        </div>
+
+        <div class="status">
+            <div class="status-title">&gt; System Status:</div>
+            <div class="status-content" id="statusContent">
+                IDLE... Ready to start proxy.<br>
+                <span class="blink">█</span>
+            </div>
+        </div>
+
+        <div id="reportSection" style="display: none;"></div>
+    </div>
+
+    <script>
+        let currentLogFile = null;
+
+        // Load UI defaults from server
+        async function loadDefaults() {
+            try {
+                const response = await fetch('/api/config');
+                const data = await response.json();
+
+                if (data.defaults) {
+                    if (data.defaults.domain) {
+                        document.getElementById('domain').value = data.defaults.domain;
+                    }
+                    if (data.defaults.bypassPaths) {
+                        document.getElementById('bypass').value = data.defaults.bypassPaths;
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to load defaults:', error);
+            }
+        }
+
+        // Load defaults when page loads
+        window.addEventListener('DOMContentLoaded', loadDefaults);
+
+        function addStatus(message) {
+            const statusContent = document.getElementById('statusContent');
+            const timestamp = new Date().toLocaleTimeString();
+            statusContent.innerHTML += `<br>[${timestamp}] ${message}`;
+            statusContent.scrollTop = statusContent.scrollHeight;
+        }
+
+        async function startProxy() {
+            const domain = document.getElementById('domain').value;
+            const bypass = document.getElementById('bypass').value;
+
+            if (!domain) {
+                addStatus('ERROR: Domain is required!');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ domain, bypass })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    currentLogFile = data.logFile;
+                    document.getElementById('startBtn').disabled = true;
+                    document.getElementById('stopBtn').disabled = false;
+                    document.getElementById('statusContent').innerHTML = `PROXY ACTIVE<br><span class="loading"></span> Logging to: ${data.logFile}<br><span class="blink">█</span>`;
+                    addStatus('Proxy started successfully!');
+                } else {
+                    addStatus('ERROR: ' + data.error);
+                }
+            } catch (error) {
+                addStatus('ERROR: Failed to start proxy - ' + error.message);
+            }
+        }
+
+        async function stopProxy() {
+            try {
+                const response = await fetch('/api/stop', {
+                    method: 'POST'
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    document.getElementById('startBtn').disabled = false;
+                    document.getElementById('stopBtn').disabled = true;
+                    addStatus('Proxy stopped. Generating report...');
+
+                    // Generate HTML report
+                    generateReport(currentLogFile);
+                } else {
+                    addStatus('ERROR: ' + data.error);
+                }
+            } catch (error) {
+                addStatus('ERROR: Failed to stop proxy - ' + error.message);
+            }
+        }
+
+        async function generateReport(logFile) {
+            try {
+                const response = await fetch('/api/generate-report', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ logFile })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    addStatus('Report generated: ' + data.htmlFile);
+
+                    // Show report link
+                    const reportSection = document.getElementById('reportSection');
+                    reportSection.style.display = 'block';
+                    reportSection.innerHTML = `
+                        <div class="report-link">
+                            <div style="margin-bottom: 10px; font-size: 10px;">&gt; REPORT READY:</div>
+                            <a href="/${data.htmlFile}" target="_blank">[ OPEN TRACE REPORT ]</a>
+                        </div>
+                    `;
+                } else {
+                    addStatus('ERROR: ' + data.error);
+                }
+            } catch (error) {
+                addStatus('ERROR: Failed to generate report - ' + error.message);
+            }
+        }
+    </script>
+</body>
+</html>
