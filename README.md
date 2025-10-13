@@ -1,6 +1,9 @@
 # tracecc
 
 AI API request tracing proxy with Web UI control and visual report generation.
+<img width="875" height="710" alt="image" src="https://github.com/user-attachments/assets/d8e58ec7-c871-4bd7-bef7-120ea5a6edb3" />
+<img width="802" height="906" alt="image" src="https://github.com/user-attachments/assets/0ae10cd6-41e4-447e-b552-e3e1a0a5be73" />
+
 
 ## Installation
 
