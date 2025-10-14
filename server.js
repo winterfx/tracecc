@@ -123,7 +123,7 @@ const webServer = http.createServer(async (req, res) => {
 
     try {
       const htmlFile = logFile.replace('.jsonl', '.html');
-      const command = `npx claude-trace --generate-html ${logFile} ${htmlFile} --no-open`;
+      const command = `npx @mariozechner/claude-trace --generate-html ${logFile} ${htmlFile} --no-open`;
 
       console.log(`Executing: ${command}`);
       const { stdout, stderr } = await execAsync(command);
