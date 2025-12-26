@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { config } from 'dotenv';
+import os from 'os';
 
 // Load environment variables from .env file
 config();
@@ -14,7 +15,117 @@ const execAsync = promisify(exec);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const WEB_PORT = 3000;
+// Claude settings file path
+const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
+
+// Store original ANTHROPIC_BASE_URL to restore later
+let originalAnthropicBaseUrl = null;
+
+// Update Claude settings to use local proxy
+function updateClaudeSettings() {
+  const proxyHost = `http://127.0.0.1:${PROXY_PORT}`;
+
+  try {
+    let settings = {};
+
+    // Read existing settings if file exists
+    if (fs.existsSync(CLAUDE_SETTINGS_PATH)) {
+      const content = fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf-8');
+      settings = JSON.parse(content);
+    } else {
+      // Create directory if it doesn't exist
+      const dir = path.dirname(CLAUDE_SETTINGS_PATH);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+    }
+
+    // Ensure env object exists
+    if (!settings.env) {
+      settings.env = {};
+    }
+
+    // Save original URL for later restoration
+    originalAnthropicBaseUrl = settings.env.ANTHROPIC_BASE_URL || null;
+
+    // Update ANTHROPIC_BASE_URL - replace only the domain, keep the path
+    let newUrl = proxyHost;
+    if (settings.env.ANTHROPIC_BASE_URL) {
+      try {
+        const originalUrl = new URL(settings.env.ANTHROPIC_BASE_URL);
+        // Combine proxy host with original path
+        newUrl = proxyHost + originalUrl.pathname;
+        // Preserve trailing slash if original had it
+        if (settings.env.ANTHROPIC_BASE_URL.endsWith('/') && !newUrl.endsWith('/')) {
+          newUrl += '/';
+        }
+      } catch (e) {
+        // If parsing fails, just use proxy host
+      }
+    }
+    settings.env.ANTHROPIC_BASE_URL = newUrl;
+
+    // Write back to file
+    fs.writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+    console.log(`Updated Claude settings: ANTHROPIC_BASE_URL = ${newUrl}`);
+  } catch (error) {
+    console.error('Failed to update Claude settings:', error.message);
+  }
+}
+
+// Restore original Claude settings
+function restoreClaudeSettings() {
+  if (originalAnthropicBaseUrl === null) {
+    console.log('No original ANTHROPIC_BASE_URL to restore');
+    return;
+  }
+
+  try {
+    let settings = {};
+
+    if (fs.existsSync(CLAUDE_SETTINGS_PATH)) {
+      const content = fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf-8');
+      settings = JSON.parse(content);
+    }
+
+    if (!settings.env) {
+      settings.env = {};
+    }
+
+    settings.env.ANTHROPIC_BASE_URL = originalAnthropicBaseUrl;
+
+    fs.writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+    console.log(`Restored Claude settings: ANTHROPIC_BASE_URL = ${originalAnthropicBaseUrl}`);
+
+    originalAnthropicBaseUrl = null;
+  } catch (error) {
+    console.error('Failed to restore Claude settings:', error.message);
+  }
+}
+
+// Open browser (cross-platform)
+function openBrowser(url) {
+  const platform = process.platform;
+  let command;
+
+  if (platform === 'darwin') {
+    command = `open "${url}"`;
+  } else if (platform === 'win32') {
+    command = `start "${url}"`;
+  } else {
+    command = `xdg-open "${url}"`;
+  }
+
+  exec(command, (error) => {
+    if (error) {
+      console.error('Failed to open browser:', error.message);
+    } else {
+      console.log(`Opened browser: ${url}`);
+    }
+  });
+}
+
+const WEB_PORT = 3001;
 const PROXY_PORT = 8080;
 
 // UI default values from environment
@@ -81,6 +192,9 @@ const webServer = http.createServer(async (req, res) => {
       currentConfig.bypassPaths = bypassPaths;
       currentConfig.logFile = logFile;
 
+      // Update Claude settings to use proxy
+      updateClaudeSettings();
+
       // Start proxy server
       startProxyServer();
 
@@ -106,6 +220,9 @@ const webServer = http.createServer(async (req, res) => {
     try {
       proxyServer.close();
       proxyServer = null;
+
+      // Restore original Claude settings
+      restoreClaudeSettings();
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true }));
@@ -221,46 +338,8 @@ function startProxyServer() {
 
       const upstreamResp = await fetch(targetUrl.toString(), fetchOptions);
       const responseTimestamp = Date.now() / 1000;
-
-      // Read response body
-      const respBuf = Buffer.from(await upstreamResp.arrayBuffer());
-
-      // Parse response body if JSON or SSE stream
-      let respBodyObj = null;
-      if (respBuf.length > 0) {
-        const contentType = upstreamResp.headers.get('content-type') || '';
-
-        if (contentType.includes('text/event-stream')) {
-          // Parse SSE (Server-Sent Events) stream
-          const text = respBuf.toString('utf-8');
-          const events = [];
-          const lines = text.split('\n');
-
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const dataStr = line.slice(6);
-              if (dataStr.trim() && dataStr !== '[DONE]') {
-                try {
-                  events.push(JSON.parse(dataStr));
-                } catch (e) {
-                  // Invalid JSON in event, skip
-                }
-              }
-            }
-          }
-
-          if (events.length > 0) {
-            respBodyObj = { stream_events: events };
-          }
-        } else {
-          // Try to parse as regular JSON
-          try {
-            respBodyObj = JSON.parse(respBuf.toString('utf-8'));
-          } catch (e) {
-            // Not JSON, keep as null
-          }
-        }
-      }
+      const contentType = upstreamResp.headers.get('content-type') || '';
+      const isSSE = contentType.includes('text/event-stream');
 
       // Write response headers
       upstreamResp.headers.forEach((v, k) => {
@@ -269,10 +348,57 @@ function startProxyServer() {
         }
       });
       res.statusCode = upstreamResp.status;
-      res.end(respBuf);
+
+      // Handle response body
+      let respBodyObj = null;
+      let respBodyRaw = null;
+      let totalBytes = 0;
+
+      if (isSSE && upstreamResp.body) {
+        // Stream SSE response: forward chunks in real-time while caching for logging
+        const chunks = [];
+        const reader = upstreamResp.body.getReader();
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            // Forward chunk to client immediately
+            res.write(value);
+
+            // Cache for logging
+            chunks.push(value);
+            totalBytes += value.length;
+          }
+        } finally {
+          reader.releaseLock();
+        }
+
+        res.end();
+
+        // Combine cached chunks for logging
+        const respBuf = Buffer.concat(chunks);
+        respBodyRaw = respBuf.toString('utf-8');
+
+      } else {
+        // Non-streaming response: read all at once
+        const respBuf = Buffer.from(await upstreamResp.arrayBuffer());
+        totalBytes = respBuf.length;
+        res.end(respBuf);
+
+        // Parse JSON if applicable
+        if (respBuf.length > 0) {
+          try {
+            respBodyObj = JSON.parse(respBuf.toString('utf-8'));
+          } catch (e) {
+            // Not JSON, keep as null
+          }
+        }
+      }
 
       // Console log
-      console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} -> ${upstreamResp.status} (req ${reqBody.length}B, resp ${respBuf.length}B) ${shouldBypass ? '[BYPASS]' : ''}`);
+      console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} -> ${upstreamResp.status} (req ${reqBody.length}B, resp ${totalBytes}B) ${shouldBypass ? '[BYPASS]' : ''} ${isSSE ? '[SSE]' : ''}`);
 
       // Skip logging for bypassed paths
       if (!shouldBypass && currentConfig.logFile) {
@@ -288,7 +414,8 @@ function startProxyServer() {
             timestamp: responseTimestamp,
             status_code: upstreamResp.status,
             headers: Object.fromEntries(upstreamResp.headers.entries()),
-            body: respBodyObj
+            body: respBodyObj,
+            body_raw: respBodyRaw
           },
           logged_at: new Date().toISOString()
         };
@@ -318,4 +445,7 @@ function startProxyServer() {
 webServer.listen(WEB_PORT, () => {
   console.log(`Web UI running at http://localhost:${WEB_PORT}`);
   console.log(`Proxy will run on port ${PROXY_PORT} when started`);
+
+  // Open browser automatically
+  openBrowser(`http://localhost:${WEB_PORT}`);
 });
