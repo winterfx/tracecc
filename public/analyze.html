@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TraceCC - Analyzer</title>
+  <link rel="stylesheet" href="/shared/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <style>
+    .source-tabs { display: flex; gap: 2px; margin-bottom: 12px; }
+    .source-tab {
+      padding: 5px 14px; font-size: 11px; border: 1px solid var(--border);
+      border-radius: 4px 4px 0 0; background: var(--bg); color: var(--text-muted);
+      cursor: pointer; border-bottom: none; font-family: var(--font-mono);
+    }
+    .source-tab--active { background: var(--bg-surface); color: var(--text-bright); border-bottom: 1px solid var(--bg-surface); margin-bottom: -1px; }
+    .breadcrumb { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-muted); margin-bottom: 8px; flex-wrap: wrap; }
+    .breadcrumb-seg { color: var(--accent-blue); cursor: pointer; }
+    .breadcrumb-seg:hover { text-decoration: underline; }
+    .dir-item {
+      display: flex; align-items: center; gap: 8px; padding: 5px 0;
+      font-size: 12px; cursor: pointer; color: var(--accent-yellow);
+    }
+    .dir-item:hover { color: var(--text-bright); }
+    .dir-item-count { color: var(--text-muted); font-size: 11px; margin-left: auto; }
+  </style>
+</head>
+<body>
+  <nav class="nav-header">
+    <span class="nav-logo">TRACECC</span>
+    <div class="nav-links">
+      <a href="/" class="nav-link">Proxy</a>
+      <a href="/analyze" class="nav-link nav-link--active">Analyze</a>
+    </div>
+  </nav>
+
+  <div class="container">
+    <h1 class="page-title">Analyzer</h1>
+
+    <!-- File Selector (collapsible) -->
+    <div class="card" id="fileSelectorCard">
+      <div class="card-header" style="cursor:pointer;display:flex;justify-content:space-between;" id="fileSelectorToggle">
+        <span><span class="toggle-indicator">[-]</span> Select Log Files</span>
+        <span id="selectedCount" style="color:var(--accent-blue);"></span>
+      </div>
+      <div class="card-body" id="fileSelectorBody">
+        <!-- Source tabs -->
+        <div class="source-tabs">
+          <button class="source-tab source-tab--active" id="srcTabLocal">Local</button>
+          <button class="source-tab" id="srcTabBrowse">Browse (~/.claude/projects)</button>
+        </div>
+
+        <!-- Local source -->
+        <div id="srcLocal">
+          <div class="file-list" id="fileList">
+            <div class="loading"><span class="spinner"></span> Loading files...</div>
+          </div>
+        </div>
+
+        <!-- Browse source -->
+        <div id="srcBrowse" style="display:none;">
+          <div class="breadcrumb" id="breadcrumb"></div>
+          <div class="file-list" id="browseList">
+            <div class="loading"><span class="spinner"></span> Loading...</div>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:12px;align-items:center;margin-top:12px;">
+          <button class="btn btn--primary" id="analyzeBtn" disabled>Analyze</button>
+          <button class="btn btn--sm" id="selectAllBtn">All</button>
+          <button class="btn btn--sm" id="selectNoneBtn">None</button>
+          <span id="statusMsg" style="color:var(--text-muted);font-size:12px;"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Error -->
+    <div id="errorBox" class="error-box mt-3" style="display:none;"></div>
+
+    <!-- Loading -->
+    <div id="loadingBox" class="loading" style="display:none;">
+      <span class="spinner"></span> Analyzing...
+    </div>
+
+    <!-- Results -->
+    <div id="results" style="display:none;" class="mt-4">
+      <div class="tab-bar" id="mainTabBar">
+        <button class="tab-btn tab-btn--active" data-tab="overview">Overview</button>
+        <button class="tab-btn" data-tab="conversations" id="tabConv" disabled>Conversations</button>
+        <button class="tab-btn" data-tab="rawcalls" id="tabRaw" disabled>Raw Calls</button>
+        <button class="tab-btn" data-tab="insight" id="tabInsight" disabled>Insight</button>
+        <button class="tab-btn" data-tab="simulator" id="tabSim" disabled>Simulator</button>
+      </div>
+
+      <!-- Overview tab -->
+      <div class="tab-panel tab-panel--active" data-tab="overview">
+        <div id="kpiGrid" class="kpi-grid"></div>
+        <div class="chart-grid" id="chartGrid">
+          <div class="chart-card"><div class="chart-title">Cache Hit Rate</div><canvas id="chartCache"></canvas></div>
+          <div class="chart-card"><div class="chart-title">Time to First Token</div><canvas id="chartTTFT"></canvas></div>
+          <div class="chart-card"><div class="chart-title">Token Usage</div><canvas id="chartTokens"></canvas></div>
+          <div class="chart-card"><div class="chart-title">Latency by Model</div><canvas id="chartLatency"></canvas></div>
+          <div class="chart-card"><div class="chart-title">Cost by Model</div><canvas id="chartCost"></canvas></div>
+          <div class="chart-card"><div class="chart-title">Model Distribution</div><canvas id="chartModels"></canvas></div>
+          <div class="chart-card chart-card--full"><div class="chart-title">Context Growth</div><canvas id="chartContext"></canvas></div>
+        </div>
+      </div>
+
+      <!-- Conversations tab -->
+      <div class="tab-panel" data-tab="conversations"><div id="convContainer"></div></div>
+
+      <!-- Raw Calls tab -->
+      <div class="tab-panel" data-tab="rawcalls"><div id="rawCallsContainer"></div></div>
+
+      <!-- Insight tab -->
+      <div class="tab-panel" data-tab="insight"><div id="insightContainer"></div></div>
+
+      <!-- Simulator tab -->
+      <div class="tab-panel" data-tab="simulator"><div id="simContainer"></div></div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { fetchLogFiles, analyzeFiles, fetchReportDataMulti, browseDir } from '/shared/api.js'
+    import { formatSize, formatDate, escapeHtml } from '/shared/utils.js'
+    import { initTabs } from '/shared/tabs.js'
+    import { initChartDefaults, renderCostChart, renderTokenChart, renderCacheChart, renderLatencyChart, renderModelChart, renderTTFTChart, renderContextChart } from '/shared/charts.js'
+    import { renderConversationsTab } from '/components/conversations.js'
+    import { renderRawCallsTab } from '/components/raw-calls.js'
+    import { renderRawInsightTab } from '/components/raw-insight.js'
+    import { renderSimulatorTab } from '/components/simulator.js'
+
+    initChartDefaults()
+
+    const fileList = document.getElementById('fileList')
+    const browseList = document.getElementById('browseList')
+    const breadcrumb = document.getElementById('breadcrumb')
+    const analyzeBtn = document.getElementById('analyzeBtn')
+    const statusMsg = document.getElementById('statusMsg')
+    const errorBox = document.getElementById('errorBox')
+    const loadingBox = document.getElementById('loadingBox')
+    const results = document.getElementById('results')
+    const selectedCount = document.getElementById('selectedCount')
+    const srcLocal = document.getElementById('srcLocal')
+    const srcBrowse = document.getElementById('srcBrowse')
+    const srcTabLocal = document.getElementById('srcTabLocal')
+    const srcTabBrowse = document.getElementById('srcTabBrowse')
+
+    let activeSource = 'local' // 'local' or 'browse'
+
+    // ── Source tab switching ──────────────────────────────────────────────────
+
+    srcTabLocal.addEventListener('click', () => {
+      activeSource = 'local'
+      srcTabLocal.classList.add('source-tab--active')
+      srcTabBrowse.classList.remove('source-tab--active')
+      srcLocal.style.display = 'block'
+      srcBrowse.style.display = 'none'
+      updateBtn()
+    })
+
+    srcTabBrowse.addEventListener('click', () => {
+      activeSource = 'browse'
+      srcTabBrowse.classList.add('source-tab--active')
+      srcTabLocal.classList.remove('source-tab--active')
+      srcLocal.style.display = 'none'
+      srcBrowse.style.display = 'block'
+      // Load default browse dir on first click
+      if (!browseLoaded) loadBrowseDir()
+      updateBtn()
+    })
+
+    // ── File selector toggle ─────────────────────────────────────────────────
+
+    const selectorToggle = document.getElementById('fileSelectorToggle')
+    const selectorBody = document.getElementById('fileSelectorBody')
+    selectorToggle.addEventListener('click', () => {
+      const open = selectorBody.style.display !== 'none'
+      selectorBody.style.display = open ? 'none' : 'block'
+      selectorToggle.querySelector('.toggle-indicator').textContent = open ? '[+]' : '[-]'
+    })
+
+    // ── Get selected files (from whichever source is active) ─────────────────
+
+    function getSelected() {
+      const container = activeSource === 'local' ? fileList : browseList
+      return [...container.querySelectorAll('input[type="checkbox"]:checked')].map(cb => cb.value)
+    }
+
+    function updateBtn() {
+      const sel = getSelected()
+      analyzeBtn.disabled = sel.length === 0
+      selectedCount.textContent = sel.length > 0 ? sel.length + ' selected' : ''
+    }
+
+    // ── Local files ──────────────────────────────────────────────────────────
+
+    fetchLogFiles().then(data => {
+      if (data.length === 0) {
+        fileList.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">No .jsonl log files found in server directory.</div>'
+        return
+      }
+      fileList.innerHTML = data.map(f => `
+        <label class="file-item">
+          <input type="checkbox" value="${escapeHtml(f.name)}">
+          <span>${escapeHtml(f.name)}</span>
+          <span class="file-meta">${formatSize(f.size)} | ${formatDate(f.modified)}</span>
+        </label>
+      `).join('')
+      fileList.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+        cb.addEventListener('change', updateBtn)
+      })
+    }).catch(e => {
+      fileList.innerHTML = `<div class="error-box">${escapeHtml(e.message)}</div>`
+    })
+
+    // ── Browse files ─────────────────────────────────────────────────────────
+
+    let browseLoaded = false
+    let currentBrowsePath = null
+
+    async function loadBrowseDir(dir) {
+      browseLoaded = true
+      browseList.innerHTML = '<div class="loading"><span class="spinner"></span> Loading...</div>'
+
+      try {
+        const data = await browseDir(dir || null)
+        currentBrowsePath = data.path
+        renderBreadcrumb(data.path, data.parent)
+        renderBrowseEntries(data.entries, data.error)
+      } catch (e) {
+        browseList.innerHTML = `<div class="error-box">${escapeHtml(e.message)}</div>`
+      }
+    }
+
+    function renderBreadcrumb(fullPath, parent) {
+      // Split path into segments and make each clickable
+      const home = fullPath.includes('/Users/') ? fullPath.split('/').slice(0, 3).join('/') : ''
+      const segments = fullPath.split('/').filter(Boolean)
+      let html = ''
+
+      segments.forEach((seg, i) => {
+        const partialPath = '/' + segments.slice(0, i + 1).join('/')
+        if (i > 0) html += '<span style="color:var(--text-muted);">/</span>'
+        html += `<span class="breadcrumb-seg" data-path="${escapeHtml(partialPath)}">${escapeHtml(seg)}</span>`
+      })
+
+      breadcrumb.innerHTML = html
+
+      // Wire breadcrumb clicks
+      breadcrumb.querySelectorAll('.breadcrumb-seg').forEach(el => {
+        el.addEventListener('click', () => loadBrowseDir(el.dataset.path))
+      })
+    }
+
+    function renderBrowseEntries(entries, error) {
+      if (error) {
+        browseList.innerHTML = `<div style="color:var(--text-muted);font-size:12px;">${escapeHtml(error)}</div>`
+        return
+      }
+
+      if (entries.length === 0) {
+        browseList.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">No directories or .jsonl files found.</div>'
+        return
+      }
+
+      let html = ''
+
+      // Directories
+      const dirs = entries.filter(e => e.type === 'dir')
+      const files = entries.filter(e => e.type === 'file')
+
+      dirs.forEach(d => {
+        const countBadge = d.jsonlCount > 0 ? `<span class="dir-item-count">${d.jsonlCount} .jsonl</span>` : ''
+        html += `<div class="dir-item" data-path="${escapeHtml(d.path)}">
+          <span style="color:var(--accent-yellow);">📁</span>
+          <span>${escapeHtml(d.name)}</span>
+          ${countBadge}
+        </div>`
+      })
+
+      // Files
+      files.forEach(f => {
+        html += `<label class="file-item">
+          <input type="checkbox" value="${escapeHtml(f.path)}">
+          <span>${escapeHtml(f.name)}</span>
+          <span class="file-meta">${formatSize(f.size)} | ${formatDate(f.modified)}</span>
+        </label>`
+      })
+
+      browseList.innerHTML = html
+
+      // Wire directory clicks
+      browseList.querySelectorAll('.dir-item').forEach(el => {
+        el.addEventListener('click', () => loadBrowseDir(el.dataset.path))
+      })
+
+      // Wire checkbox changes
+      browseList.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+        cb.addEventListener('change', updateBtn)
+      })
+    }
+
+    // ── Select All / None ────────────────────────────────────────────────────
+
+    document.getElementById('selectAllBtn').addEventListener('click', () => {
+      const container = activeSource === 'local' ? fileList : browseList
+      container.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = true)
+      updateBtn()
+    })
+
+    document.getElementById('selectNoneBtn').addEventListener('click', () => {
+      const container = activeSource === 'local' ? fileList : browseList
+      container.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = false)
+      updateBtn()
+    })
+
+    // ── Init tabs ────────────────────────────────────────────────────────────
+
+    initTabs(results)
+
+    // ── Analyze ──────────────────────────────────────────────────────────────
+
+    analyzeBtn.addEventListener('click', async () => {
+      const selected = getSelected()
+      if (selected.length === 0) return
+
+      analyzeBtn.disabled = true
+      errorBox.style.display = 'none'
+      loadingBox.style.display = 'flex'
+      results.style.display = 'none'
+      statusMsg.textContent = 'Analyzing...'
+
+      try {
+        const [analysisResult, reportResult] = await Promise.allSettled([
+          analyzeFiles(selected),
+          fetchReportDataMulti(selected),
+        ])
+
+        loadingBox.style.display = 'none'
+
+        if (analysisResult.status === 'rejected') {
+          errorBox.textContent = 'Analysis failed: ' + analysisResult.reason.message
+          errorBox.style.display = 'block'
+          analyzeBtn.disabled = false
+          statusMsg.textContent = ''
+          return
+        }
+
+        const analysis = analysisResult.value
+        if (analysis.error) {
+          errorBox.textContent = analysis.error
+          errorBox.style.display = 'block'
+          analyzeBtn.disabled = false
+          statusMsg.textContent = ''
+          return
+        }
+
+        statusMsg.textContent = `Done \u2014 ${analysis.overview.totalRequests} requests analyzed.`
+        results.style.display = 'block'
+
+        // Collapse file selector
+        selectorBody.style.display = 'none'
+        selectorToggle.querySelector('.toggle-indicator').textContent = '[+]'
+
+        // Render KPIs
+        renderKPIs(analysis)
+
+        // Render charts
+        renderCostChart(document.getElementById('chartCost'), analysis.cost)
+        renderTokenChart(document.getElementById('chartTokens'), analysis.tokens)
+        renderCacheChart(document.getElementById('chartCache'), analysis.cache)
+        renderLatencyChart(document.getElementById('chartLatency'), analysis.latency)
+        renderModelChart(document.getElementById('chartModels'), analysis.modelSelection)
+        renderTTFTChart(document.getElementById('chartTTFT'), analysis.ttft)
+        renderContextChart(document.getElementById('chartContext'), analysis.contextGrowth)
+
+        // Render report tabs if available
+        if (reportResult.status === 'fulfilled' && reportResult.value && !reportResult.value.error) {
+          const report = reportResult.value
+          document.getElementById('tabConv').disabled = false
+          document.getElementById('tabRaw').disabled = false
+          document.getElementById('tabInsight').disabled = false
+          document.getElementById('tabSim').disabled = false
+
+          renderConversationsTab(document.getElementById('convContainer'), report.conversations)
+          renderRawInsightTab(document.getElementById('rawCallsContainer'), report.rawEntries)
+          renderRawCallsTab(document.getElementById('insightContainer'), report.rawCalls)
+          renderSimulatorTab(document.getElementById('simContainer'), report.conversations)
+        }
+
+      } catch (e) {
+        loadingBox.style.display = 'none'
+        errorBox.textContent = e.message
+        errorBox.style.display = 'block'
+      }
+
+      analyzeBtn.disabled = false
+    })
+
+    function renderKPIs(data) {
+      const s = data.efficiencyScore
+      const kpis = [
+        { label: 'Total Requests', value: s.totalRequests.toLocaleString(), good: true },
+        { label: 'Avg TTFT', value: s.avgTTFT.toFixed(3) + 's', good: s.avgTTFT <= 2 },
+        { label: 'Avg Latency', value: s.avgLatency.toFixed(2) + 's', good: s.avgLatency <= 10 },
+        { label: 'Total Cost', value: '$' + s.totalCost.toFixed(2), good: s.totalCost <= 1 },
+        { label: 'Cache Hit Rate', value: s.cacheHitRate.toFixed(1) + '%', good: s.cacheHitRate >= 50 },
+        { label: 'Error Rate', value: s.errorRate.toFixed(1) + '%', good: s.errorRate <= 5 },
+        { label: 'I/O Ratio', value: s.inputOutputRatio.toFixed(1), good: s.inputOutputRatio <= 50 },
+        { label: 'Total Tokens', value: (data.tokens.totalInput + data.tokens.totalOutput).toLocaleString(), good: true },
+      ]
+
+      document.getElementById('kpiGrid').innerHTML = kpis.map(k =>
+        `<div class="kpi-card">
+          <span class="kpi-label">${k.label}</span>
+          <span class="kpi-value ${k.good ? 'kpi-value--good' : 'kpi-value--bad'}">${k.value}</span>
+        </div>`
+      ).join('')
+    }
+  </script>
+</body>
+</html>

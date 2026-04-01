@@ -7,6 +7,8 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { config } from 'dotenv';
 import os from 'os';
+import { parseLogFiles, computeAnalysis } from './analyze-lib.js';
+import { parseJSONL, buildRawCalls, buildConversations, buildRawEntries } from './generate-report.js';
 
 // Load environment variables from .env file
 config();
@@ -240,7 +242,7 @@ const webServer = http.createServer(async (req, res) => {
 
     try {
       const htmlFile = logFile.replace('.jsonl', '.html');
-      const command = `npx @mariozechner/claude-trace --generate-html ${logFile} ${htmlFile} --no-open`;
+      const command = `node generate-report.js ${logFile} ${htmlFile}`;
 
       console.log(`Executing: ${command}`);
       const { stdout, stderr } = await execAsync(command);
@@ -263,28 +265,276 @@ const webServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // Serve static files
+  // ─── Analyze API Routes ────────────────────────────────────────────────────
+
+  // ─── Browse directories for .jsonl files ───────────────────────────────────
+
+  if (req.url.startsWith('/api/browse') && req.method === 'GET') {
+    try {
+      const reqUrl = new URL(req.url, `http://${req.headers.host}`);
+      let dir = reqUrl.searchParams.get('dir');
+
+      // Default to ~/.claude/projects
+      if (!dir) {
+        dir = path.join(os.homedir(), '.claude', 'projects');
+      }
+
+      // Resolve to absolute path
+      const resolvedDir = path.resolve(dir);
+
+      // Restrict browsing to ~/.claude/ to prevent arbitrary filesystem traversal
+      const allowedRoot = path.join(os.homedir(), '.claude');
+      if (!resolvedDir.startsWith(allowedRoot + path.sep) && resolvedDir !== allowedRoot) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Access denied: browsing is restricted to ~/.claude/' }));
+        return;
+      }
+
+      if (!fs.existsSync(resolvedDir) || !fs.statSync(resolvedDir).isDirectory()) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ path: resolvedDir, parent: path.dirname(resolvedDir), entries: [], error: 'Directory not found' }));
+        return;
+      }
+
+      const items = fs.readdirSync(resolvedDir);
+      const entries = [];
+
+      for (const name of items) {
+        if (name.startsWith('.') && name !== '.claude') continue; // skip hidden files except .claude
+        const fullPath = path.join(resolvedDir, name);
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.isDirectory()) {
+            // Count .jsonl files recursively (shallow — just check immediate children)
+            let jsonlCount = 0;
+            try {
+              jsonlCount = fs.readdirSync(fullPath).filter(f => f.endsWith('.jsonl')).length;
+            } catch { /* ignore permission errors */ }
+            entries.push({ name, type: 'dir', path: fullPath, jsonlCount });
+          } else if (name.endsWith('.jsonl')) {
+            entries.push({
+              name, type: 'file', path: fullPath,
+              size: stat.size,
+              modified: stat.mtime.toISOString(),
+            });
+          }
+        } catch { /* skip unreadable entries */ }
+      }
+
+      // Sort: directories first (alphabetical), then files (newest first)
+      entries.sort((a, b) => {
+        if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+        if (a.type === 'dir') return a.name.localeCompare(b.name);
+        return new Date(b.modified) - new Date(a.modified);
+      });
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        path: resolvedDir,
+        parent: path.dirname(resolvedDir) !== resolvedDir && path.dirname(resolvedDir).startsWith(allowedRoot) ? path.dirname(resolvedDir) : null,
+        entries,
+      }));
+    } catch (error) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+    return;
+  }
+
+  if (req.url === '/api/log-files' && req.method === 'GET') {
+    try {
+      const logFiles = fs.readdirSync(__dirname)
+        .filter(f => f.endsWith('.jsonl'))
+        .map(f => {
+          const stat = fs.statSync(path.join(__dirname, f));
+          return {
+            name: f,
+            size: stat.size,
+            modified: stat.mtime.toISOString(),
+          };
+        })
+        .sort((a, b) => new Date(b.modified) - new Date(a.modified));
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(logFiles));
+    } catch (error) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+    return;
+  }
+
+  if (req.url === '/api/analyze' && req.method === 'POST') {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    try {
+      const { files: fileNames } = JSON.parse(body);
+
+      if (!Array.isArray(fileNames) || fileNames.length === 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'No files specified' }));
+        return;
+      }
+
+      // Resolve file paths — support both absolute paths and local filenames
+      const allowedRoot = path.join(os.homedir(), '.claude');
+      const filePaths = fileNames.map(f => {
+        if (path.isAbsolute(f)) {
+          const resolved = path.resolve(f);
+          if (!resolved.startsWith(allowedRoot + path.sep) && !resolved.startsWith(__dirname + path.sep)) {
+            throw new Error(`Access denied: ${f}`);
+          }
+          return resolved;
+        }
+        // Legacy: local filenames (no path separators)
+        if (f.includes('/') || f.includes('\\') || f.includes('..') || !f.endsWith('.jsonl')) {
+          throw new Error(`Invalid filename: ${f}`);
+        }
+        return path.join(__dirname, f);
+      });
+
+      // Validate all files exist and are .jsonl
+      for (const fp of filePaths) {
+        if (!fp.endsWith('.jsonl')) throw new Error(`Not a .jsonl file: ${fp}`);
+        if (!fs.existsSync(fp)) throw new Error(`File not found: ${fp}`);
+      }
+
+      const displayNames = filePaths.map(f => path.basename(f));
+      const records = parseLogFiles(filePaths);
+
+      if (records.length === 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'No valid log entries found in selected files' }));
+        return;
+      }
+
+      const result = computeAnalysis(records, displayNames);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    } catch (error) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+    return;
+  }
+
+  // ─── Report Data API (for React frontend) ──────────────────────────────────
+
+  if (req.url === '/api/report-data' && req.method === 'POST') {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    try {
+      const { logFile, files } = JSON.parse(body);
+
+      // Determine file list: accept { files: string[] } or { logFile: string }
+      const fileNames = Array.isArray(files) && files.length > 0
+        ? files
+        : logFile ? [logFile] : [];
+
+      if (fileNames.length === 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'No files specified' }));
+        return;
+      }
+
+      // Resolve file paths — support both absolute paths and local filenames
+      const allowedRoot = path.join(os.homedir(), '.claude');
+      const filePaths = fileNames.map(f => {
+        if (path.isAbsolute(f)) {
+          const resolved = path.resolve(f);
+          if (!resolved.startsWith(allowedRoot + path.sep) && !resolved.startsWith(__dirname + path.sep)) {
+            throw new Error(`Access denied: ${f}`);
+          }
+          return resolved;
+        }
+        if (f.includes('/') || f.includes('\\') || f.includes('..') || !f.endsWith('.jsonl')) {
+          throw new Error(`Invalid filename: ${f}`);
+        }
+        return path.join(__dirname, f);
+      });
+
+      for (const fp of filePaths) {
+        if (!fp.endsWith('.jsonl')) throw new Error(`Not a .jsonl file: ${fp}`);
+        if (!fs.existsSync(fp)) throw new Error(`File not found: ${fp}`);
+      }
+
+      // Parse all files into a single entries array
+      let allEntries = [];
+      for (const fp of filePaths) {
+        const entries = parseJSONL(fp);
+        allEntries = allEntries.concat(entries);
+      }
+
+      // Sort by request timestamp for correct chronological ordering across files
+      if (fileNames.length > 1) {
+        allEntries.sort((a, b) => (a.request?.timestamp || 0) - (b.request?.timestamp || 0));
+      }
+
+      const rawCalls = buildRawCalls(allEntries);
+      const conversations = buildConversations(allEntries);
+      const rawEntries = buildRawEntries(allEntries);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        rawCalls,
+        conversations,
+        rawEntries,
+        inputFile: filePaths.length === 1 ? path.basename(filePaths[0]) : filePaths.map(f => path.basename(f)).join(', '),
+      }));
+    } catch (error) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message }));
+    }
+    return;
+  }
+
+  // ─── Static files (vanilla HTML/CSS/JS frontend) ───────────────────────────
+
+  const mimeTypes = {
+    '.html': 'text/html',
+    '.js': 'application/javascript',
+    '.css': 'text/css',
+    '.svg': 'image/svg+xml',
+    '.png': 'image/png',
+    '.ico': 'image/x-icon',
+  };
+
+  // HTML pages
   if (req.url === '/' || req.url === '/index.html') {
     serveFile(res, path.join(__dirname, 'public', 'index.html'), 'text/html');
     return;
   }
 
-  // Serve generated HTML reports and other files
+  if (req.url === '/analyze' || req.url === '/analyze.html') {
+    serveFile(res, path.join(__dirname, 'public', 'analyze.html'), 'text/html');
+    return;
+  }
+
+  if (req.url.startsWith('/report/') || req.url === '/report') {
+    serveFile(res, path.join(__dirname, 'public', 'report.html'), 'text/html');
+    return;
+  }
+
+  // Shared assets and component JS modules
+  if (req.url.startsWith('/shared/') || req.url.startsWith('/components/')) {
+    const filePath = path.join(__dirname, 'public', req.url.split('?')[0]);
+    const ext = path.extname(filePath);
+    serveFile(res, filePath, mimeTypes[ext] || 'application/octet-stream');
+    return;
+  }
+
+  // Generated HTML reports (e.g. log-xxx.html in root dir)
   if (req.url.endsWith('.html')) {
     const filePath = path.join(__dirname, req.url.slice(1));
     serveFile(res, filePath, 'text/html');
     return;
   }
 
-  if (req.url.endsWith('.css')) {
+  // Other static assets in public/
+  if (req.url.endsWith('.css') || req.url.endsWith('.js')) {
     const filePath = path.join(__dirname, 'public', req.url.slice(1));
-    serveFile(res, filePath, 'text/css');
-    return;
-  }
-
-  if (req.url.endsWith('.js')) {
-    const filePath = path.join(__dirname, 'public', req.url.slice(1));
-    serveFile(res, filePath, 'application/javascript');
+    const ext = path.extname(filePath);
+    serveFile(res, filePath, mimeTypes[ext] || 'application/octet-stream');
     return;
   }
 
@@ -353,6 +603,7 @@ function startProxyServer() {
       let respBodyObj = null;
       let respBodyRaw = null;
       let totalBytes = 0;
+      let firstChunkTimestamp = null;
 
       if (isSSE && upstreamResp.body) {
         // Stream SSE response: forward chunks in real-time while caching for logging
@@ -363,6 +614,11 @@ function startProxyServer() {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
+
+            // Record TTFT: timestamp of first data chunk
+            if (!firstChunkTimestamp) {
+              firstChunkTimestamp = Date.now() / 1000;
+            }
 
             // Forward chunk to client immediately
             res.write(value);
@@ -415,7 +671,8 @@ function startProxyServer() {
             status_code: upstreamResp.status,
             headers: Object.fromEntries(upstreamResp.headers.entries()),
             body: respBodyObj,
-            body_raw: respBodyRaw
+            body_raw: respBodyRaw,
+            first_chunk_timestamp: firstChunkTimestamp || null
           },
           logged_at: new Date().toISOString()
         };
