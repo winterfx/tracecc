@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TraceCC - Report</title>
+  <link rel="stylesheet" href="/shared/style.css">
+</head>
+<body>
+  <nav class="nav-header">
+    <span class="nav-logo">TRACECC</span>
+    <div class="nav-links">
+      <a href="/" class="nav-link">Proxy</a>
+      <a href="/analyze" class="nav-link">Analyze</a>
+    </div>
+  </nav>
+
+  <div class="container">
+    <h1 class="page-title">
+      Report: <code id="reportTitle" style="color:var(--accent-teal);font-size:14px;"></code>
+    </h1>
+
+    <!-- Loading -->
+    <div id="loadingBox" class="loading">
+      <span class="spinner"></span> Loading report data...
+    </div>
+
+    <!-- Error -->
+    <div id="errorBox" class="error-box" style="display:none;">
+      <div id="errorMsg"></div>
+      <div class="mt-2"><a href="/analyze">&larr; Back to Analyzer</a></div>
+    </div>
+
+    <!-- Results -->
+    <div id="results" style="display:none;">
+      <div class="tab-bar" id="mainTabBar">
+        <button class="tab-btn tab-btn--active" data-tab="conversations">Conversations</button>
+        <button class="tab-btn" data-tab="rawcalls">Raw Calls</button>
+        <button class="tab-btn" data-tab="insight">Insight</button>
+        <button class="tab-btn" data-tab="simulator">Simulator</button>
+      </div>
+
+      <div class="tab-panel tab-panel--active" data-tab="conversations"><div id="convContainer"></div></div>
+      <div class="tab-panel" data-tab="rawcalls"><div id="rawCallsContainer"></div></div>
+      <div class="tab-panel" data-tab="insight"><div id="insightContainer"></div></div>
+      <div class="tab-panel" data-tab="simulator"><div id="simContainer"></div></div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { fetchReportData } from '/shared/api.js'
+    import { initTabs } from '/shared/tabs.js'
+    import { renderConversationsTab } from '/components/conversations.js'
+    import { renderRawCallsTab } from '/components/raw-calls.js'
+    import { renderRawInsightTab } from '/components/raw-insight.js'
+    import { renderSimulatorTab } from '/components/simulator.js'
+
+    const loadingBox = document.getElementById('loadingBox')
+    const errorBox = document.getElementById('errorBox')
+    const errorMsg = document.getElementById('errorMsg')
+    const results = document.getElementById('results')
+    const reportTitle = document.getElementById('reportTitle')
+
+    // Get logFile from URL path: /report/filename.jsonl
+    const pathParts = window.location.pathname.split('/report/')
+    const logFile = pathParts[1] ? decodeURIComponent(pathParts[1]) : null
+
+    if (!logFile) {
+      loadingBox.style.display = 'none'
+      errorMsg.textContent = 'No log file specified.'
+      errorBox.style.display = 'block'
+    } else {
+      reportTitle.textContent = logFile
+
+      initTabs(results)
+
+      fetchReportData(logFile).then(data => {
+        loadingBox.style.display = 'none'
+
+        if (data.error) {
+          errorMsg.textContent = data.error
+          errorBox.style.display = 'block'
+          return
+        }
+
+        results.style.display = 'block'
+
+        renderConversationsTab(document.getElementById('convContainer'), data.conversations)
+        renderRawCallsTab(document.getElementById('rawCallsContainer'), data.rawCalls)
+        renderRawInsightTab(document.getElementById('insightContainer'), data.rawEntries)
+        renderSimulatorTab(document.getElementById('simContainer'), data.conversations)
+
+      }).catch(e => {
+        loadingBox.style.display = 'none'
+        errorMsg.textContent = e.message
+        errorBox.style.display = 'block'
+      })
+    }
+  </script>
+</body>
+</html>

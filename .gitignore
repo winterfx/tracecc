@@ -10,9 +10,13 @@ requests.log
 # HTML reports (but not source files)
 log-*.html
 
-# Public directory - track source files only
+# Public directory - track source files
 public/*
 !public/index.html
+!public/analyze.html
+!public/report.html
+!public/shared/
+!public/components/
 
 # Claude trace files
 .claude-trace/
