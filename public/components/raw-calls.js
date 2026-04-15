@@ -82,7 +82,7 @@ export function renderRawCallsTab(container, calls) {
       <td class="text-right tabular-nums" style="font-size:12px;">${formatDuration(call.latency)}</td>
       <td class="text-right tabular-nums" style="font-size:12px;">${formatTokens(call.totalInput)}</td>
       <td class="text-right tabular-nums" style="font-size:12px;">${formatTokens(call.outputTokens)}</td>
-      <td class="text-right tabular-nums" style="font-size:12px;${cacheColorClass(call.cacheHitRate)}">${call.cacheHitRate.toFixed(1)}%</td>
+      <td class="text-right tabular-nums" style="font-size:12px;${cacheColorClass(call.cacheHitRate)}">${(call.cacheHitRate ?? 0).toFixed(1)}%</td>
       <td class="text-right tabular-nums" style="font-size:12px;">${call.messageCount} msgs</td>
     </tr>`
     html += renderCallDetail(call)

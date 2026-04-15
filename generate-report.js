@@ -14,6 +14,15 @@ import fs from 'fs';
 import path from 'path';
 import { detectFormat, convertCCEntries } from './analyze-lib.js';
 
+// ── Constants ───────────────────────────────────────────────────────────────
+
+const TEXT_PREVIEW_LEN = 200;     // max chars for user text previews
+const TOOL_RESULT_MAX = 1000;     // max chars for tool result content display
+const TOOL_RESULT_SHORT = 500;    // max chars for tool results in step view
+const SYSTEM_PROMPT_MAX = 3000;   // max chars before truncating system prompt
+const DESCRIPTION_MAX = 120;      // max chars for tool description preview
+const SYSTEM_PROMPT_THRESHOLD = 10000; // system prompt length heuristic for main thread detection
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function extractSSEData(bodyRaw) {
@@ -37,7 +46,7 @@ function extractSSEData(bodyRaw) {
         if (delta.type === 'text_delta') text += delta.text || '';
         if (delta.type === 'thinking_delta') thinking += delta.thinking || '';
       }
-    } catch {}
+    } catch (e) { /* malformed SSE event, skip */ }
   }
   if (usage) usage.output_tokens = finalOutputTokens || usage.output_tokens || 0;
   return { usage, model, text, thinking };
@@ -53,13 +62,13 @@ function getFirstUserText(messages) {
   for (const m of messages) {
     if (m.role !== 'user') continue;
     const content = m.content;
-    if (typeof content === 'string') return stripSystemReminders(content).slice(0, 200);
+    if (typeof content === 'string') return stripSystemReminders(content).slice(0, TEXT_PREVIEW_LEN);
     if (Array.isArray(content)) {
       const texts = content
         .filter(p => p.type === 'text' && typeof p.text === 'string')
         .map(p => stripSystemReminders(p.text))
         .filter(t => t.length > 0);
-      return texts.join(' ').slice(0, 200);
+      return texts.join(' ').slice(0, TEXT_PREVIEW_LEN);
     }
   }
   return '';
@@ -185,10 +194,174 @@ function buildRawCalls(entries) {
   });
 }
 
-function buildConversations(entries) {
-  // Group by (modelClass, firstUserText)
-  const groups = new Map();
+/**
+ * Extract tool_use and tool_result from a list of new messages (delta since previous step).
+ * Returns { newToolCalls, newToolResults }.
+ */
+function extractStepTools(newMessages) {
+  const newToolCalls = [];
+  const newToolResults = [];
 
+  for (const msg of newMessages) {
+    if (!Array.isArray(msg.content)) continue;
+    if (msg.role === 'assistant') {
+      for (const part of msg.content) {
+        if (part.type === 'tool_use') {
+          newToolCalls.push({
+            name: part.name,
+            summary: toolCallSummary(part.name, part.input || {}),
+            category: categorizeToolCall(part.name),
+          });
+        }
+      }
+    } else if (msg.role === 'user') {
+      for (const part of msg.content) {
+        if (part.type === 'tool_result') {
+          const rawContent = typeof part.content === 'string'
+            ? part.content
+            : Array.isArray(part.content)
+              ? part.content.map(c => c.text || '').join('\n')
+              : '';
+          newToolResults.push({
+            toolUseId: part.tool_use_id,
+            content: rawContent.slice(0, TOOL_RESULT_SHORT),
+            isError: !!part.is_error,
+          });
+        }
+      }
+    }
+  }
+
+  return { newToolCalls, newToolResults };
+}
+
+/** Build a step object for each API call in a conversation group. */
+function buildSteps(members) {
+  return members.map((member, stepIdx) => {
+    const stepBody = member.entry.request?.body || {};
+    const stepMsgs = stepBody.messages || [];
+    const stepSSE = member.entry._ccContent
+      ? extractFromCCContent(member.entry._ccContent, member.entry._ccUsage, member.entry._ccModel)
+      : extractSSEData(member.entry.response?.body_raw);
+    const stepUsage = stepSSE.usage || {};
+
+    const prevMsgCount = stepIdx > 0 ? members[stepIdx - 1].messageCount : 0;
+    const newMessages = stepMsgs.slice(prevMsgCount);
+    const { newToolCalls, newToolResults } = extractStepTools(newMessages);
+
+    const inputTokens = stepUsage.input_tokens || 0;
+    const cacheCreation = stepUsage.cache_creation_input_tokens || 0;
+    const cacheRead = stepUsage.cache_read_input_tokens || 0;
+    const outputTokens = stepUsage.output_tokens || 0;
+    const totalInput = inputTokens + cacheCreation + cacheRead;
+    const stepModel = stepSSE.model || stepBody.model || member.model || 'unknown';
+
+    return {
+      stepIndex: stepIdx,
+      entryIndex: member.entryIndex,
+      timestamp: member.entry.request?.timestamp,
+      responseTimestamp: member.entry.response?.timestamp,
+      latency: (member.entry.response?.timestamp || 0) - (member.entry.request?.timestamp || 0),
+      model: stepModel,
+      modelClass: getModelClass(stepModel),
+      messageCount: stepMsgs.length,
+      prevMessageCount: prevMsgCount,
+      responseText: stepSSE.text,
+      thinkingText: stepSSE.thinking,
+      newToolCalls,
+      newToolResults,
+      totalInput, inputTokens, cacheCreation, cacheRead, outputTokens,
+      cacheHitRate: totalInput > 0 ? parseFloat(((cacheRead / totalInput) * 100).toFixed(1)) : 0,
+      _ccUuid: member.entry._ccUuid || null,
+      _ccParentUuid: member.entry._ccParentUuid || null,
+    };
+  });
+}
+
+/**
+ * Split turns into segments at each real user input boundary, and assign
+ * steps to the correct segment based on message-index ranges.
+ * Returns { segments, stepsBySegment }.
+ */
+function splitTurnsIntoSegments(allTurns, messages, steps) {
+  // Split turns at each new user text input
+  const segments = [];
+  let currentSegment = [];
+  for (const turn of allTurns) {
+    if (turn.type === 'user' && turn.content.text && currentSegment.length > 0) {
+      segments.push(currentSegment);
+      currentSegment = [turn];
+    } else {
+      currentSegment.push(turn);
+    }
+  }
+  if (currentSegment.length > 0) segments.push(currentSegment);
+
+  // Build user-input boundary indices from messages to map steps → segments
+  const userInputMsgIndices = [0];
+  let realUserCount = 0;
+  for (let mi = 0; mi < messages.length; mi++) {
+    if (messages[mi].role === 'user') {
+      const txt = extractContent(messages[mi].content);
+      if (txt.text) {
+        realUserCount++;
+        if (realUserCount > 1) userInputMsgIndices.push(mi);
+      }
+    }
+  }
+
+  // Assign each step to the correct segment
+  const stepsBySegment = segments.map(() => []);
+  for (const step of steps) {
+    let segIdx = 0;
+    for (let s = userInputMsgIndices.length - 1; s >= 0; s--) {
+      if (step.prevMessageCount >= userInputMsgIndices[s] || step.messageCount > userInputMsgIndices[s]) {
+        segIdx = s;
+        break;
+      }
+    }
+    if (segIdx < stepsBySegment.length) stepsBySegment[segIdx].push(step);
+  }
+
+  return { segments, stepsBySegment };
+}
+
+/** Link Agent tool_use calls in main threads to matching sub-agent conversations. */
+function linkSubAgents(conversations) {
+  const mainThreads = conversations.filter(c => c.isMainThread);
+  const subAgents = conversations.filter(c => !c.isMainThread);
+
+  for (const main of mainThreads) {
+    for (const turn of main.turns) {
+      for (const tool of turn.toolCalls) {
+        if (tool.name !== 'Agent') continue;
+        const agentPrompt = tool.input?.prompt || '';
+        const prompt = stripSystemReminders(agentPrompt).slice(0, TEXT_PREVIEW_LEN);
+        const match = subAgents.find(sa =>
+          sa.firstUserText && prompt && sa.firstUserText.startsWith(prompt.slice(0, 60))
+        );
+        if (match) {
+          tool.linkedConversationId = match.id;
+          match.parentConversationId = main.id;
+          if (!main.subAgents.find(s => s.id === match.id)) {
+            main.subAgents.push(match);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Build structured conversation objects from parsed log entries.
+ *
+ * Groups API calls by (modelClass, firstUserText), then splits each group
+ * into per-user-input segments. Each segment becomes one conversation card
+ * in the UI. Also links main threads to sub-agent conversations.
+ */
+function buildConversations(entries) {
+  // Step 1: Group entries by (modelClass, firstUserText)
+  const groups = new Map();
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
     const reqBody = e.request?.body || {};
@@ -205,174 +378,79 @@ function buildConversations(entries) {
     groups.get(key).push({ entryIndex: i, entry: e, messageCount: messages.length, model });
   }
 
-  // Build conversation objects
+  // Step 2: Build conversations from each group
   const conversations = [];
   for (const [key, members] of groups) {
     members.sort((a, b) => a.messageCount - b.messageCount);
-    const final = members[members.length - 1]; // entry with most messages = final state
+    const final = members[members.length - 1];
     const first = members[0];
     const reqBody = final.entry.request?.body || {};
     const messages = reqBody.messages || [];
-    const sse = final.entry._ccContent
+    const sseData = final.entry._ccContent
       ? extractFromCCContent(final.entry._ccContent, final.entry._ccUsage, final.entry._ccModel)
       : extractSSEData(final.entry.response?.body_raw);
 
-    // Extract turns from messages
-    const turns = extractTurns(messages, sse);
+    const allTurns = extractTurns(messages, sseData);
+    const steps = buildSteps(members);
 
-    // Detect main thread vs sub-agent
+    // Detect main thread vs sub-agent (prefer CC metadata over heuristic)
     const sysLen = getSystemPromptLength(reqBody.system);
     const modelClass = getModelClass(final.model);
-    const isMainThread = modelClass === 'opus' || sysLen > 10000;
+    const hasSidechainMeta = members.some(m => m.entry._ccIsSidechain !== undefined);
+    const isMainThread = hasSidechainMeta
+      ? !final.entry._ccIsSidechain
+      : (modelClass === 'opus' || sysLen > SYSTEM_PROMPT_THRESHOLD);
 
-    // Extract system prompt text
+    // Extract system prompt
     const systemRaw = reqBody.system;
     let systemPromptText = '';
-    if (typeof systemRaw === 'string') {
-      systemPromptText = systemRaw;
-    } else if (Array.isArray(systemRaw)) {
-      systemPromptText = systemRaw.map(p => p.text || '').join('\n\n');
-    }
+    if (typeof systemRaw === 'string') systemPromptText = systemRaw;
+    else if (Array.isArray(systemRaw)) systemPromptText = systemRaw.map(p => p.text || '').join('\n\n');
 
-    // Extract tool definitions
     const toolDefs = (reqBody.tools || []).map(t => ({
       name: t.name || '',
-      description: (t.description || '').slice(0, 120),
+      description: (t.description || '').slice(0, DESCRIPTION_MAX),
     }));
 
-    // Build steps for simulator: each step = one API call with its delta
-    const steps = members.map((member, stepIdx) => {
-      const stepBody = member.entry.request?.body || {};
-      const stepMsgs = stepBody.messages || [];
-      const stepSSE = member.entry._ccContent
-        ? extractFromCCContent(member.entry._ccContent, member.entry._ccUsage, member.entry._ccModel)
-        : extractSSEData(member.entry.response?.body_raw);
-      const stepUsage = stepSSE.usage || {};
+    const truncatedSystemPrompt = systemPromptText.length > SYSTEM_PROMPT_MAX
+      ? systemPromptText.slice(0, SYSTEM_PROMPT_MAX) + `\n\n... [truncated, ${systemPromptText.length} chars total]`
+      : systemPromptText;
 
-      // Compute delta: new messages since previous step
-      const prevMsgCount = stepIdx > 0 ? members[stepIdx - 1].messageCount : 0;
-      const newMessages = stepMsgs.slice(prevMsgCount);
+    // Step 3: Split into per-user-input segments
+    const { segments, stepsBySegment } = splitTurnsIntoSegments(allTurns, messages, steps);
 
-      // Extract tool_use from new assistant messages
-      const newToolCalls = [];
-      for (const msg of newMessages) {
-        if (msg.role === 'assistant' && Array.isArray(msg.content)) {
-          for (const part of msg.content) {
-            if (part.type === 'tool_use') {
-              newToolCalls.push({
-                name: part.name,
-                summary: toolCallSummary(part.name, part.input || {}),
-                category: categorizeToolCall(part.name),
-              });
-            }
-          }
-        }
-      }
+    for (let segIdx = 0; segIdx < segments.length; segIdx++) {
+      const segTurns = segments[segIdx];
+      const segUserTurn = segTurns.find(t => t.type === 'user' && t.content.text);
+      const segUserText = segUserTurn ? segUserTurn.content.text.slice(0, TEXT_PREVIEW_LEN) : getFirstUserText(messages);
+      const segSteps = stepsBySegment[segIdx] || [];
 
-      // Extract tool_result from new user messages
-      const newToolResults = [];
-      for (const msg of newMessages) {
-        if (msg.role === 'user' && Array.isArray(msg.content)) {
-          for (const part of msg.content) {
-            if (part.type === 'tool_result') {
-              newToolResults.push({
-                toolUseId: part.tool_use_id,
-                content: typeof part.content === 'string'
-                  ? part.content.slice(0, 500)
-                  : Array.isArray(part.content)
-                    ? part.content.map(c => c.text || '').join('\n').slice(0, 500)
-                    : '',
-                isError: !!part.is_error,
-              });
-            }
-          }
-        }
-      }
-
-      const inputTokens = stepUsage.input_tokens || 0;
-      const cacheCreation = stepUsage.cache_creation_input_tokens || 0;
-      const cacheRead = stepUsage.cache_read_input_tokens || 0;
-      const outputTokens = stepUsage.output_tokens || 0;
-      const totalInput = inputTokens + cacheCreation + cacheRead;
-
-      // Model info: prefer SSE response model, fallback to request body
-      const stepModel = stepSSE.model || stepBody.model || member.model || 'unknown';
-
-      return {
-        stepIndex: stepIdx,
-        entryIndex: member.entryIndex,
-        timestamp: member.entry.request?.timestamp,
-        responseTimestamp: member.entry.response?.timestamp,
-        latency: (member.entry.response?.timestamp || 0) - (member.entry.request?.timestamp || 0),
-        model: stepModel,
-        modelClass: getModelClass(stepModel),
-        messageCount: stepMsgs.length,
-        prevMessageCount: prevMsgCount,
-        responseText: stepSSE.text,
-        thinkingText: stepSSE.thinking,
-        newToolCalls,
-        newToolResults,
-        totalInput,
-        inputTokens,
-        cacheCreation,
-        cacheRead,
-        outputTokens,
-        cacheHitRate: totalInput > 0 ? parseFloat(((cacheRead / totalInput) * 100).toFixed(1)) : 0,
-        // CC uuid metadata (if available)
-        _ccUuid: member.entry._ccUuid || null,
-        _ccParentUuid: member.entry._ccParentUuid || null,
-      };
-    });
-
-    conversations.push({
-      id: key,
-      modelClass,
-      model: final.model,
-      firstUserText: getFirstUserText(messages),
-      isMainThread,
-      totalRounds: members.length,
-      entryIndices: members.map(m => m.entryIndex),
-      startTime: first.entry.request?.timestamp,
-      endTime: final.entry.response?.timestamp,
-      turns,
-      steps,
-      finalResponseText: sse.text,
-      finalThinking: sse.thinking,
-      subAgents: [], // filled later
-      systemPrompt: systemPromptText.length > 3000
-        ? systemPromptText.slice(0, 3000) + `\n\n... [truncated, ${systemPromptText.length} chars total]`
-        : systemPromptText,
-      toolDefs,
-    });
-  }
-
-  // Build hierarchy: link Agent tool_use in main thread to sub-agent conversations
-  const mainThreads = conversations.filter(c => c.isMainThread);
-  const subAgents = conversations.filter(c => !c.isMainThread);
-
-  for (const main of mainThreads) {
-    for (const turn of main.turns) {
-      for (const tool of turn.toolCalls) {
-        if (tool.name === 'Agent') {
-          const agentPrompt = tool.input?.prompt || '';
-          // Find matching sub-agent by comparing prompt with firstUserText
-          const match = subAgents.find(sa => {
-            const prompt = stripSystemReminders(agentPrompt).slice(0, 200);
-            return sa.firstUserText && prompt && sa.firstUserText.startsWith(prompt.slice(0, 60));
-          });
-          if (match) {
-            tool.linkedConversationId = match.id;
-            match.parentConversationId = main.id;
-            if (!main.subAgents.find(s => s.id === match.id)) {
-              main.subAgents.push(match);
-            }
-          }
-        }
-      }
+      conversations.push({
+        id: `${key}::seg${segIdx}`,
+        modelClass,
+        model: final.model,
+        firstUserText: segUserText,
+        isMainThread,
+        totalRounds: segSteps.length,
+        entryIndices: segSteps.map(s => s.entryIndex),
+        startTime: segSteps.length > 0 ? segSteps[0].timestamp : (segIdx === 0 ? first.entry.request?.timestamp : undefined),
+        endTime: segSteps.length > 0 ? segSteps[segSteps.length - 1].responseTimestamp : (segIdx === segments.length - 1 ? final.entry.response?.timestamp : undefined),
+        turns: segTurns,
+        steps: segSteps,
+        finalResponseText: segIdx === segments.length - 1 ? sseData.text : '',
+        finalThinking: segIdx === segments.length - 1 ? sseData.thinking : '',
+        subAgents: [],
+        systemPrompt: segIdx === 0 ? truncatedSystemPrompt : '',
+        toolDefs: segIdx === 0 ? toolDefs : [],
+        _segmentIndex: segIdx,
+        _groupKey: key,
+      });
     }
   }
 
-  // Sort: main thread first, then sub-agents by start time
+  // Step 4: Link sub-agents to main threads and sort
+  linkSubAgents(conversations);
+
   conversations.sort((a, b) => {
     if (a.isMainThread && !b.isMainThread) return -1;
     if (!a.isMainThread && b.isMainThread) return 1;
@@ -419,7 +497,7 @@ function extractTurns(messages, finalSSE) {
               toolResults.push({
                 toolUseId: part.tool_use_id,
                 content: rawContent.length > 1000
-                  ? rawContent.slice(0, 1000) + `\n... [${rawContent.length} chars total]`
+                  ? rawContent.slice(0, TOOL_RESULT_MAX) + `\n... [${rawContent.length} chars total]`
                   : rawContent,
                 isError: !!part.is_error,
               });
@@ -428,9 +506,6 @@ function extractTurns(messages, finalSSE) {
         }
         if (toolResults.length > 0) i++; // skip the tool_result user message
       }
-
-      // If this is the last assistant message and we have SSE data, use it for the text
-      const isLast = i >= messages.length - 1 || (i + 1 === messages.length - 1 && toolResults.length > 0);
 
       turns.push({
         type: 'assistant',
@@ -444,21 +519,21 @@ function extractTurns(messages, finalSSE) {
     }
   }
 
-  // If we have SSE text and the last turn is assistant, append/replace with SSE text
+  // If we have SSE text, update or append the final assistant turn
   if (finalSSE.text && turns.length > 0) {
     const lastAssistant = turns.filter(t => t.type === 'assistant').pop();
-    // The final SSE response is the response to the last request (which includes all messages)
-    // Add it as a final turn if there isn't already a good text response
-    if (!lastAssistant || !lastAssistant.content.text) {
+    if (lastAssistant && !lastAssistant.content.text) {
+      // Update existing assistant turn that has no text yet
+      lastAssistant.content.text = finalSSE.text;
+      lastAssistant.content.thinking = finalSSE.thinking;
+    } else if (!lastAssistant) {
+      // No assistant turn exists at all — add one
       turns.push({
         type: 'assistant',
         content: { text: finalSSE.text, thinking: finalSSE.thinking },
         toolCalls: [],
         toolResults: [],
       });
-    } else if (lastAssistant && !lastAssistant.content.text && finalSSE.text) {
-      lastAssistant.content.text = finalSSE.text;
-      lastAssistant.content.thinking = finalSSE.thinking;
     }
   }
 
@@ -1329,7 +1404,7 @@ function renderConversation(conv, isOpen) {
           \${modelBadge}
         </div>
         <div class="conv-meta">
-          \${conv.totalRounds} rounds &middot; \${fmtTime(conv.startTime)}
+          \${conv.turns.length} turns\${conv.totalRounds ? ' &middot; ' + conv.totalRounds + ' rounds' : ''} \${conv.startTime ? '&middot; ' + fmtTime(conv.startTime) : ''}
         </div>
       </div>
       <div class="conv-body \${isOpen ? 'open' : ''}">
@@ -1735,7 +1810,8 @@ function renderDiagram() {
 
     // Down arrow between rows
     if (ri < rowGroups.length - 1) {
-      const nextRowVisible = rowGroups[ri + 1][0][0].stepIndex <= cur;
+      const nextRow = rowGroups[ri + 1];
+      const nextRowVisible = nextRow && nextRow[0] && nextRow[0][0] ? nextRow[0][0].stepIndex <= cur : false;
       const downPos = isReverse ? 'flex-start' : 'flex-end';
       html += '<div style="width:100%;display:flex;justify-content:' + downPos + ';padding:0 40px">';
       html += '<div class="flow-arrow' + (nextRowVisible ? ' visible' : '') + '" style="transform:rotate(90deg)">&#8594;</div>';
@@ -1825,7 +1901,21 @@ if (isCLI) {
     process.exit(1);
   }
   console.log(`Parsing ${inputFile}...`);
-  const entries = parseJSONL(inputFile);
+  let entries = parseJSONL(inputFile);
+
+  // Auto-discover and load subagent files
+  const dir = path.dirname(inputFile);
+  const base = path.basename(inputFile, '.jsonl');
+  const subagentsDir = path.join(dir, base, 'subagents');
+  if (fs.existsSync(subagentsDir) && fs.statSync(subagentsDir).isDirectory()) {
+    const subFiles = fs.readdirSync(subagentsDir).filter(f => f.endsWith('.jsonl'));
+    for (const sf of subFiles) {
+      const subEntries = parseJSONL(path.join(subagentsDir, sf));
+      entries = entries.concat(subEntries);
+      console.log(`  + ${sf} (${subEntries.length} entries)`);
+    }
+    entries.sort((a, b) => (a.request?.timestamp || 0) - (b.request?.timestamp || 0));
+  }
   console.log(`Found ${entries.length} entries`);
 
   const rawCalls = buildRawCalls(entries);

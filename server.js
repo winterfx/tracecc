@@ -3,7 +3,7 @@ import { URL } from 'url';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { exec } from 'child_process';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { config } from 'dotenv';
 import os from 'os';
@@ -87,7 +87,9 @@ function restoreClaudeSettings() {
 
     if (fs.existsSync(CLAUDE_SETTINGS_PATH)) {
       const content = fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf-8');
-      settings = JSON.parse(content);
+      try { settings = JSON.parse(content); } catch {
+        console.error('Failed to parse Claude settings, writing fresh restore');
+      }
     }
 
     if (!settings.env) {
@@ -105,20 +107,20 @@ function restoreClaudeSettings() {
   }
 }
 
-// Open browser (cross-platform)
+// Open browser (cross-platform) — uses execFile to avoid shell injection
 function openBrowser(url) {
   const platform = process.platform;
-  let command;
+  let cmd, args;
 
   if (platform === 'darwin') {
-    command = `open "${url}"`;
+    cmd = 'open'; args = [url];
   } else if (platform === 'win32') {
-    command = `start "${url}"`;
+    cmd = 'cmd'; args = ['/c', 'start', '', url];
   } else {
-    command = `xdg-open "${url}"`;
+    cmd = 'xdg-open'; args = [url];
   }
 
-  exec(command, (error) => {
+  execFile(cmd, args, (error) => {
     if (error) {
       console.error('Failed to open browser:', error.message);
     } else {
@@ -129,6 +131,8 @@ function openBrowser(url) {
 
 const WEB_PORT = 3001;
 const PROXY_PORT = 8080;
+const MAX_REQUEST_BODY = 1024 * 1024;        // 1 MB limit for API request bodies
+const PROXY_TIMEOUT_MS = 5 * 60 * 1000;      // 5 minutes — long enough for AI responses
 
 // UI default values from environment
 const UI_DEFAULTS = {
@@ -138,6 +142,7 @@ const UI_DEFAULTS = {
 
 // Proxy state
 let proxyServer = null;
+let proxyStarting = false; // guard against concurrent start requests
 let currentConfig = {
   target: '',
   bypassPaths: [],
@@ -168,16 +173,45 @@ const webServer = http.createServer(async (req, res) => {
 
   if (req.url === '/api/start' && req.method === 'POST') {
     let body = '';
-    for await (const chunk of req) body += chunk;
-    const { domain, bypass } = JSON.parse(body);
+    let bodySize = 0;
+    for await (const chunk of req) {
+      bodySize += chunk.length;
+      if (bodySize > MAX_REQUEST_BODY) { res.writeHead(413); res.end('Body too large'); return; }
+      body += chunk;
+    }
+    let parsed;
+    try { parsed = JSON.parse(body); } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: 'Invalid JSON' }));
+      return;
+    }
+    const { domain, bypass } = parsed;
 
-    if (proxyServer) {
+    if (proxyServer || proxyStarting) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: false, error: 'Proxy already running' }));
       return;
     }
+    proxyStarting = true;
 
     try {
+      // Validate target domain is a valid URL
+      if (!domain) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'Domain is required' }));
+        return;
+      }
+      try {
+        const targetUrl = new URL(domain);
+        if (!['http:', 'https:'].includes(targetUrl.protocol)) {
+          throw new Error('Only http/https protocols are allowed');
+        }
+      } catch (urlErr) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: `Invalid domain URL: ${urlErr.message}` }));
+        return;
+      }
+
       // Parse bypass paths
       const bypassPaths = bypass
         .split(',')
@@ -199,6 +233,7 @@ const webServer = http.createServer(async (req, res) => {
 
       // Start proxy server
       startProxyServer();
+      proxyStarting = false;
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
@@ -206,6 +241,7 @@ const webServer = http.createServer(async (req, res) => {
         logFile: logFile
       }));
     } catch (error) {
+      proxyStarting = false;
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: false, error: error.message }));
     }
@@ -237,26 +273,32 @@ const webServer = http.createServer(async (req, res) => {
 
   if (req.url === '/api/generate-report' && req.method === 'POST') {
     let body = '';
-    for await (const chunk of req) body += chunk;
-    const { logFile } = JSON.parse(body);
-
+    let bodySize = 0;
+    for await (const chunk of req) {
+      bodySize += chunk.length;
+      if (bodySize > MAX_REQUEST_BODY) { res.writeHead(413); res.end('Body too large'); return; }
+      body += chunk;
+    }
     try {
-      const htmlFile = logFile.replace('.jsonl', '.html');
-      const command = `node generate-report.js ${logFile} ${htmlFile}`;
+      const { logFile } = JSON.parse(body);
 
-      console.log(`Executing: ${command}`);
-      const { stdout, stderr } = await execAsync(command);
-
-      if (stderr) {
-        console.error('stderr:', stderr);
+      // Validate filename to prevent path traversal
+      if (!logFile || logFile.includes('/') || logFile.includes('\\') || logFile.includes('..') || !logFile.endsWith('.jsonl')) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'Invalid log file name' }));
+        return;
       }
-      console.log('stdout:', stdout);
+
+      const htmlFile = logFile.replace('.jsonl', '.html');
+      const execFileAsync = promisify(execFile);
+      console.log(`Executing: node generate-report.js ${logFile} ${htmlFile}`);
+      const { stdout, stderr } = await execFileAsync('node', ['generate-report.js', logFile, htmlFile], { cwd: __dirname });
+
+      if (stderr) console.error('stderr:', stderr);
+      if (stdout) console.log('stdout:', stdout);
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        success: true,
-        htmlFile: htmlFile
-      }));
+      res.end(JSON.stringify({ success: true, htmlFile }));
     } catch (error) {
       console.error('Report generation error:', error);
       res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -366,7 +408,12 @@ const webServer = http.createServer(async (req, res) => {
 
   if (req.url === '/api/analyze' && req.method === 'POST') {
     let body = '';
-    for await (const chunk of req) body += chunk;
+    let bodySize = 0;
+    for await (const chunk of req) {
+      bodySize += chunk.length;
+      if (bodySize > MAX_REQUEST_BODY) { res.writeHead(413); res.end('Body too large'); return; }
+      body += chunk;
+    }
     try {
       const { files: fileNames } = JSON.parse(body);
 
@@ -422,7 +469,12 @@ const webServer = http.createServer(async (req, res) => {
 
   if (req.url === '/api/report-data' && req.method === 'POST') {
     let body = '';
-    for await (const chunk of req) body += chunk;
+    let bodySize = 0;
+    for await (const chunk of req) {
+      bodySize += chunk.length;
+      if (bodySize > MAX_REQUEST_BODY) { res.writeHead(413); res.end('Body too large'); return; }
+      body += chunk;
+    }
     try {
       const { logFile, files } = JSON.parse(body);
 
@@ -458,15 +510,32 @@ const webServer = http.createServer(async (req, res) => {
         if (!fs.existsSync(fp)) throw new Error(`File not found: ${fp}`);
       }
 
+      // Auto-discover subagent files for Claude Code session logs
+      // Structure: <session-id>.jsonl -> <session-id>/subagents/agent-*.jsonl
+      const allFilePaths = [...filePaths];
+      for (const fp of filePaths) {
+        const dir = path.dirname(fp);
+        const base = path.basename(fp, '.jsonl');
+        const subagentsDir = path.join(dir, base, 'subagents');
+        if (fs.existsSync(subagentsDir) && fs.statSync(subagentsDir).isDirectory()) {
+          try {
+            const subFiles = fs.readdirSync(subagentsDir)
+              .filter(f => f.endsWith('.jsonl'))
+              .map(f => path.join(subagentsDir, f));
+            allFilePaths.push(...subFiles);
+          } catch { /* ignore permission errors */ }
+        }
+      }
+
       // Parse all files into a single entries array
       let allEntries = [];
-      for (const fp of filePaths) {
+      for (const fp of allFilePaths) {
         const entries = parseJSONL(fp);
         allEntries = allEntries.concat(entries);
       }
 
       // Sort by request timestamp for correct chronological ordering across files
-      if (fileNames.length > 1) {
+      if (allFilePaths.length > 1) {
         allEntries.sort((a, b) => (a.request?.timestamp || 0) - (b.request?.timestamp || 0));
       }
 
@@ -515,9 +584,18 @@ const webServer = http.createServer(async (req, res) => {
     return;
   }
 
+  // Helper: validate resolved path is within allowed directory
+  function safePath(base, reqPath) {
+    const resolved = path.resolve(base, reqPath);
+    if (!resolved.startsWith(base + path.sep) && resolved !== base) return null;
+    return resolved;
+  }
+
   // Shared assets and component JS modules
   if (req.url.startsWith('/shared/') || req.url.startsWith('/components/')) {
-    const filePath = path.join(__dirname, 'public', req.url.split('?')[0]);
+    const publicDir = path.join(__dirname, 'public');
+    const filePath = safePath(publicDir, req.url.split('?')[0].slice(1));
+    if (!filePath) { res.writeHead(403); res.end('Forbidden'); return; }
     const ext = path.extname(filePath);
     serveFile(res, filePath, mimeTypes[ext] || 'application/octet-stream');
     return;
@@ -525,14 +603,17 @@ const webServer = http.createServer(async (req, res) => {
 
   // Generated HTML reports (e.g. log-xxx.html in root dir)
   if (req.url.endsWith('.html')) {
-    const filePath = path.join(__dirname, req.url.slice(1));
+    const filePath = safePath(__dirname, req.url.slice(1));
+    if (!filePath) { res.writeHead(403); res.end('Forbidden'); return; }
     serveFile(res, filePath, 'text/html');
     return;
   }
 
   // Other static assets in public/
   if (req.url.endsWith('.css') || req.url.endsWith('.js')) {
-    const filePath = path.join(__dirname, 'public', req.url.slice(1));
+    const publicDir = path.join(__dirname, 'public');
+    const filePath = safePath(publicDir, req.url.slice(1));
+    if (!filePath) { res.writeHead(403); res.end('Forbidden'); return; }
     const ext = path.extname(filePath);
     serveFile(res, filePath, mimeTypes[ext] || 'application/octet-stream');
     return;
@@ -554,135 +635,128 @@ function serveFile(res, filePath, contentType) {
   });
 }
 
+// Headers that should not be forwarded from upstream to client
+const HOP_BY_HOP_HEADERS = new Set([
+  'transfer-encoding', 'connection', 'keep-alive', 'proxy-authenticate',
+  'proxy-authorization', 'te', 'trailer', 'upgrade',
+]);
+
+/** Stream SSE response: forward chunks in real-time while caching for logging. */
+async function handleSSEResponse(upstreamResp, res) {
+  const chunks = [];
+  let totalBytes = 0;
+  let firstChunkTimestamp = null;
+  const reader = upstreamResp.body.getReader();
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!firstChunkTimestamp) firstChunkTimestamp = Date.now() / 1000;
+      res.write(value);
+      chunks.push(value);
+      totalBytes += value.length;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  res.end();
+
+  return {
+    bodyObj: null,
+    bodyRaw: Buffer.concat(chunks).toString('utf-8'),
+    totalBytes,
+    firstChunkTimestamp,
+  };
+}
+
+/** Read non-streaming response body, forward to client, parse JSON if possible. */
+async function handleStandardResponse(upstreamResp, res) {
+  const respBuf = Buffer.from(await upstreamResp.arrayBuffer());
+  res.end(respBuf);
+
+  let bodyObj = null;
+  if (respBuf.length > 0) {
+    try { bodyObj = JSON.parse(respBuf.toString('utf-8')); } catch { /* not JSON */ }
+  }
+
+  return { bodyObj, bodyRaw: null, totalBytes: respBuf.length, firstChunkTimestamp: null };
+}
+
+/** Write a log entry to the JSONL log file. */
+function writeLogEntry(logFile, { requestTimestamp, req, targetUrl, reqBodyObj, responseTimestamp, upstreamResp, respResult }) {
+  const logEntry = {
+    request: {
+      timestamp: requestTimestamp,
+      method: req.method,
+      url: targetUrl.toString(),
+      headers: req.headers,
+      body: reqBodyObj,
+    },
+    response: {
+      timestamp: responseTimestamp,
+      status_code: upstreamResp.status,
+      headers: Object.fromEntries(upstreamResp.headers.entries()),
+      body: respResult.bodyObj,
+      body_raw: respResult.bodyRaw,
+      first_chunk_timestamp: respResult.firstChunkTimestamp || null,
+    },
+    logged_at: new Date().toISOString(),
+  };
+  try {
+    fs.appendFileSync(logFile, JSON.stringify(logEntry) + '\n');
+  } catch (err) {
+    console.error('log write failed', err);
+  }
+}
+
 function startProxyServer() {
   proxyServer = http.createServer(async (req, res) => {
     try {
       const requestTimestamp = Date.now() / 1000;
       const targetUrl = new URL(req.url, currentConfig.target);
+      const shouldBypass = currentConfig.bypassPaths.some(bp => req.url === bp || req.url.startsWith(bp + '/') || req.url.startsWith(bp + '?'));
 
-      // Check if this path should be bypassed
-      const shouldBypass = currentConfig.bypassPaths.some(path => req.url.includes(path));
-
-      // Read request body
+      // Read and parse request body
       const reqChunks = [];
       for await (const chunk of req) reqChunks.push(chunk);
       const reqBody = Buffer.concat(reqChunks);
-
-      // Parse request body if JSON
       let reqBodyObj = null;
       if (reqBody.length > 0) {
-        try {
-          reqBodyObj = JSON.parse(reqBody.toString('utf-8'));
-        } catch (e) {
-          // Not JSON, keep as null
-        }
+        try { reqBodyObj = JSON.parse(reqBody.toString('utf-8')); } catch { /* not JSON */ }
       }
 
-      // Forward request to backend
-      const fetchOptions = {
-        method: req.method,
-        headers: req.headers,
-        body: reqBody.length ? reqBody : undefined,
-        redirect: 'manual'
-      };
+      // Forward to upstream with timeout
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), PROXY_TIMEOUT_MS);
+      let upstreamResp;
+      try {
+        upstreamResp = await fetch(targetUrl.toString(), {
+          method: req.method, headers: req.headers,
+          body: reqBody.length ? reqBody : undefined,
+          redirect: 'manual', signal: controller.signal,
+        });
+      } finally { clearTimeout(timeout); }
 
-      const upstreamResp = await fetch(targetUrl.toString(), fetchOptions);
       const responseTimestamp = Date.now() / 1000;
-      const contentType = upstreamResp.headers.get('content-type') || '';
-      const isSSE = contentType.includes('text/event-stream');
+      const isSSE = (upstreamResp.headers.get('content-type') || '').includes('text/event-stream');
 
-      // Write response headers
+      // Forward response headers (skip hop-by-hop)
       upstreamResp.headers.forEach((v, k) => {
-        if (!['transfer-encoding','connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','upgrade'].includes(k.toLowerCase())) {
-          res.setHeader(k, v);
-        }
+        if (!HOP_BY_HOP_HEADERS.has(k.toLowerCase())) res.setHeader(k, v);
       });
       res.statusCode = upstreamResp.status;
 
       // Handle response body
-      let respBodyObj = null;
-      let respBodyRaw = null;
-      let totalBytes = 0;
-      let firstChunkTimestamp = null;
+      const respResult = (isSSE && upstreamResp.body)
+        ? await handleSSEResponse(upstreamResp, res)
+        : await handleStandardResponse(upstreamResp, res);
 
-      if (isSSE && upstreamResp.body) {
-        // Stream SSE response: forward chunks in real-time while caching for logging
-        const chunks = [];
-        const reader = upstreamResp.body.getReader();
+      console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} -> ${upstreamResp.status} (req ${reqBody.length}B, resp ${respResult.totalBytes}B) ${shouldBypass ? '[BYPASS]' : ''} ${isSSE ? '[SSE]' : ''}`);
 
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            // Record TTFT: timestamp of first data chunk
-            if (!firstChunkTimestamp) {
-              firstChunkTimestamp = Date.now() / 1000;
-            }
-
-            // Forward chunk to client immediately
-            res.write(value);
-
-            // Cache for logging
-            chunks.push(value);
-            totalBytes += value.length;
-          }
-        } finally {
-          reader.releaseLock();
-        }
-
-        res.end();
-
-        // Combine cached chunks for logging
-        const respBuf = Buffer.concat(chunks);
-        respBodyRaw = respBuf.toString('utf-8');
-
-      } else {
-        // Non-streaming response: read all at once
-        const respBuf = Buffer.from(await upstreamResp.arrayBuffer());
-        totalBytes = respBuf.length;
-        res.end(respBuf);
-
-        // Parse JSON if applicable
-        if (respBuf.length > 0) {
-          try {
-            respBodyObj = JSON.parse(respBuf.toString('utf-8'));
-          } catch (e) {
-            // Not JSON, keep as null
-          }
-        }
-      }
-
-      // Console log
-      console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} -> ${upstreamResp.status} (req ${reqBody.length}B, resp ${totalBytes}B) ${shouldBypass ? '[BYPASS]' : ''} ${isSSE ? '[SSE]' : ''}`);
-
-      // Skip logging for bypassed paths
+      // Log (unless bypassed)
       if (!shouldBypass && currentConfig.logFile) {
-        const logEntry = {
-          request: {
-            timestamp: requestTimestamp,
-            method: req.method,
-            url: targetUrl.toString(),
-            headers: req.headers,
-            body: reqBodyObj
-          },
-          response: {
-            timestamp: responseTimestamp,
-            status_code: upstreamResp.status,
-            headers: Object.fromEntries(upstreamResp.headers.entries()),
-            body: respBodyObj,
-            body_raw: respBodyRaw,
-            first_chunk_timestamp: firstChunkTimestamp || null
-          },
-          logged_at: new Date().toISOString()
-        };
-
-        // Append to JSONL file
-        fs.appendFile(currentConfig.logFile, JSON.stringify(logEntry) + '\n', (err) => {
-          if (err) {
-            console.error('log write failed', err);
-          }
-        });
+        writeLogEntry(currentConfig.logFile, { requestTimestamp, req, targetUrl, reqBodyObj, responseTimestamp, upstreamResp, respResult });
       }
 
     } catch (err) {
@@ -706,3 +780,15 @@ webServer.listen(WEB_PORT, () => {
   // Open browser automatically
   openBrowser(`http://localhost:${WEB_PORT}`);
 });
+
+// Restore Claude settings on process exit to avoid leaving stale proxy config
+function cleanupOnExit() {
+  if (proxyServer) {
+    try { proxyServer.close(); } catch {}
+    proxyServer = null;
+  }
+  restoreClaudeSettings();
+}
+process.on('SIGINT', () => { cleanupOnExit(); process.exit(0); });
+process.on('SIGTERM', () => { cleanupOnExit(); process.exit(0); });
+process.on('exit', cleanupOnExit);

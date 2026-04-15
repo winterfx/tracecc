@@ -1,78 +1,82 @@
 # tracecc
 
-AI API request tracing proxy with Web UI, log analysis, and visual report generation.
+Trace and analyze Claude Code API traffic. Captures requests via HTTP proxy or reads Claude Code's native `.jsonl` logs offline.
 
-## Installation
+## Quick Start
 
 ```bash
 npm install
+npm start        # opens http://localhost:3001
 ```
 
-## Usage
+## Features
+
+**Proxy Mode** — intercept live API traffic
+
+1. Enter target domain, click START (proxy on `:8080`)
+2. Claude Code's `ANTHROPIC_BASE_URL` auto-switches to the proxy
+3. Use Claude Code normally — all traffic is logged
+4. Click STOP — settings restored, logs saved as `log-<timestamp>.jsonl`
+
+**Analyze Mode** (`/analyze`) — offline log analysis
+
+- Browse `.jsonl` files from `~/.claude/projects/`
+- Token usage, cost breakdown, model distribution, cache hit rates
+- Automatically loads sub-agent logs from `subagents/` directories
+
+**Analyze / Report Mode** — 5 tabs for exploring captured data
+
+| Tab | Description |
+|-----|-------------|
+| **Overview** | Cost breakdown, token usage charts, model distribution, cache hit rates |
+| **Conversations** | Chat history split by user input, with thinking, tool calls, and sub-agent linking |
+| **Raw Calls** | Every API call with status, latency, input/output tokens, and cache stats |
+| **Insight** | Raw request/response payloads and SSE event streams |
+| **Simulator** | Swim-lane diagram replaying the request flow across user, agents, LLM, and tools |
+
+### Screenshots
+
+**Overview** — token usage, cost, cache hit rate, TTFT charts
+
+![Overview](docs/overview.png)
+
+**Conversations** — chat turns with tool calls and sub-agent linking
+
+![Conversations](docs/conversations.png)
+
+**Raw Calls** — per-request metrics table
+
+![Raw Calls](docs/raw-calls.png)
+
+**Insight** — raw request/response payloads
+
+![Insight](docs/insight.png)
+
+**Simulator** — swim-lane request flow diagram
+
+![Simulator](docs/simulator.png)
 
 ```bash
-npm start
-# or
-make start
-```
-
-Open `http://localhost:3001` to access the Web UI. The browser opens automatically on start.
-
-### Pages
-
-- **Proxy** (`/`) - Configure and control the tracing proxy
-- **Analyze** (`/analyze`) - Browse log files from `~/.claude/projects/` and view usage analytics (token usage, cost, model breakdown, etc.)
-- **Report** (`/report/<file>`) - Visual report with conversations, raw API calls, and request simulator
-
-### Proxy Workflow
-
-1. Enter target domain (e.g., `https://api.anthropic.com`)
-2. Optionally enter paths to skip logging (comma-separated)
-3. Click **START** - proxy launches on port `8080`
-4. Claude Code's `ANTHROPIC_BASE_URL` is automatically updated to use the proxy
-5. Click **STOP** - proxy stops and `ANTHROPIC_BASE_URL` is restored
-
-### Analyze Workflow
-
-1. Navigate to the **Analyze** page
-2. Browse `~/.claude/projects/` to find `.jsonl` log files
-3. Select one or more files to view token usage, cost breakdown, and model statistics
-
-### Generate Report
-
-Click **View Report** from the Proxy page after a session, or run manually:
-
-```bash
+# CLI report generation
 node generate-report.js <input.jsonl> [output.html]
 ```
 
-## Log Format
+## Supported Log Formats
 
-JSONL format, filename `log-<timestamp>.jsonl`:
+| Format | Source | Sub-agent detection |
+|--------|--------|---------------------|
+| Proxy-captured | `log-*.jsonl` from proxy mode | Heuristic (model + system prompt length) |
+| Claude Code native | `~/.claude/projects/**/*.jsonl` | Exact (`isSidechain` metadata) |
 
-```json
-{
-  "request": { "timestamp": 1234.56, "method": "POST", "url": "...", "headers": {}, "body": {} },
-  "response": { "timestamp": 1234.78, "status_code": 200, "headers": {}, "body": {}, "body_raw": "...", "first_chunk_timestamp": null },
-  "logged_at": "2025-10-12T10:30:00.000Z"
-}
-```
-
-Supports SSE stream capture with real-time forwarding.
-
-## Makefile
+## Commands
 
 ```
-make install   # Install dependencies
-make start     # Start server
-make stop      # Kill running server
-make report    # Generate report from latest log
-make clean     # Remove generated files and node_modules
+make install    # npm install
+make start      # start server
+make stop       # kill server
+make report     # generate report from latest log
+make clean      # remove generated files
 ```
-
-## Tech Stack
-
-Node.js, native HTTP proxy, vanilla HTML/CSS/JS, Chart.js
 
 ## License
 

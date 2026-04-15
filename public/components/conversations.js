@@ -1,5 +1,14 @@
-// ConversationsTab — port of ConversationsTab.tsx
+// ConversationsTab — renders conversation cards with turns, tools, and sub-agents
 import { toolIcon, toolNameClass, toolSummary, modelBadgeClass, formatTime, simpleMarkdown, escapeHtml } from '../shared/utils.js'
+
+/** Generate a collapsible toggle section (header + hidden body). */
+function collapsible(label, contentHtml, extraClass = '') {
+  const id = 'tog-' + Math.random().toString(36).slice(2, 8)
+  return `<div class="toggle-header" data-toggle-target="${id}">
+    <span class="toggle-indicator">[+]</span> ${label}
+  </div>
+  <div class="toggle-body collapsible-content${extraClass ? ' ' + extraClass : ''}" id="${id}">${contentHtml}</div>`
+}
 
 function renderToolLine(tool) {
   const summary = toolSummary(tool)
@@ -12,8 +21,8 @@ function renderToolLine(tool) {
 
 function renderTurn(turn, turnNum, isLast) {
   if (turn.type === 'user') {
-    if (!turn.content.text && turn.toolResults.length > 0) return ''
-    if (!turn.content.text) return ''
+    if (!turn.content?.text && (turn.toolResults?.length || 0) > 0) return ''
+    if (!turn.content?.text) return ''
     return `<div class="conv-turn">
       <div class="conv-turn-label conv-turn-label--user">Turn ${turnNum} &mdash; User</div>
       <div style="white-space:pre-wrap;word-break:break-word;color:#e0e0e0;font-size:12px;">${escapeHtml(turn.content.text)}</div>
@@ -21,31 +30,22 @@ function renderTurn(turn, turnNum, isLast) {
   }
 
   // Assistant turn
-  const hasThinking = !!turn.content.thinking
-  const hasText = !!turn.content.text
-  const hasTools = turn.toolCalls.length > 0
+  const hasThinking = !!turn.content?.thinking
+  const hasText = !!turn.content?.text
+  const hasTools = (turn.toolCalls?.length || 0) > 0
   let html = `<div class="conv-turn">
     <div class="conv-turn-label conv-turn-label--assistant">Turn ${turnNum} &mdash; Assistant</div>`
 
   if (hasThinking) {
-    const id = 'think-' + Math.random().toString(36).slice(2, 8)
-    html += `<div class="toggle-header" data-toggle-target="${id}">
-      <span class="toggle-indicator">[+]</span> Thinking...
-    </div>
-    <div class="toggle-body collapsible-content collapsible-content--thinking" id="${id}">${escapeHtml(turn.content.thinking)}</div>`
+    html += collapsible('Thinking...', escapeHtml(turn.content.thinking), 'collapsible-content--thinking')
   }
 
   if (hasTools) {
     turn.toolCalls.forEach(tool => {
       html += renderToolLine(tool)
-      // Matching tool results
       turn.toolResults.filter(r => r.toolUseId === tool.id).forEach(result => {
-        const rid = 'res-' + Math.random().toString(36).slice(2, 8)
-        const errClass = result.isError ? ' collapsible-content--error' : ''
-        html += `<div class="toggle-header" data-toggle-target="${rid}">
-          <span class="toggle-indicator">[+]</span> Result (${(result.content || '').length} chars)
-        </div>
-        <div class="toggle-body collapsible-content${errClass}" id="${rid}">${escapeHtml(result.content)}</div>`
+        const errClass = result.isError ? 'collapsible-content--error' : ''
+        html += collapsible(`Result (${(result.content || '').length} chars)`, escapeHtml(result.content), errClass)
       })
     })
   }
@@ -71,28 +71,17 @@ function renderConversationCard(conv, defaultOpen = false) {
 
   // System prompt
   if (conv.systemPrompt) {
-    const sid = 'sp-' + Math.random().toString(36).slice(2, 8)
     bodyHtml += `<div style="padding:12px 14px;">
-      <div class="toggle-header" data-toggle-target="${sid}">
-        <span class="toggle-indicator">[+]</span> System Prompt (${conv.systemPrompt.length.toLocaleString()} chars)
-      </div>
-      <div class="toggle-body collapsible-content collapsible-content--tall" id="${sid}">${escapeHtml(conv.systemPrompt)}</div>
+      ${collapsible(`System Prompt (${conv.systemPrompt.length.toLocaleString()} chars)`, escapeHtml(conv.systemPrompt), 'collapsible-content--tall')}
     </div>`
   }
 
   // Tool definitions
   if (conv.toolDefs && conv.toolDefs.length > 0) {
-    const tid = 'td-' + Math.random().toString(36).slice(2, 8)
-    bodyHtml += `<div class="conv-turn">
-      <div class="toggle-header" data-toggle-target="${tid}">
-        <span class="toggle-indicator">[+]</span> Tools (${conv.toolDefs.length})
-      </div>
-      <div class="toggle-body collapsible-content" id="${tid}">
-        ${conv.toolDefs.map(td =>
-          `<div style="padding:2px 0;"><span style="color:var(--accent-yellow);font-weight:600;">${escapeHtml(td.name)}</span> <span style="color:#808080;margin-left:4px;">${escapeHtml(td.description)}</span></div>`
-        ).join('')}
-      </div>
-    </div>`
+    const toolListHtml = conv.toolDefs.map(td =>
+      `<div style="padding:2px 0;"><span style="color:var(--accent-yellow);font-weight:600;">${escapeHtml(td.name)}</span> <span style="color:#808080;margin-left:4px;">${escapeHtml(td.description)}</span></div>`
+    ).join('')
+    bodyHtml += `<div class="conv-turn">${collapsible(`Tools (${conv.toolDefs.length})`, toolListHtml)}</div>`
   }
 
   // Turns
@@ -116,7 +105,7 @@ function renderConversationCard(conv, defaultOpen = false) {
         <span class="badge ${badgeClass}">${escapeHtml(conv.model)}</span>
       </div>
       <div class="conv-header-right">
-        ${conv.totalRounds} rounds &middot; ${formatTime(conv.startTime)}
+        ${conv.turns.length} turns${conv.totalRounds ? ` &middot; ${conv.totalRounds} rounds` : ''} ${conv.startTime ? `&middot; ${formatTime(conv.startTime)}` : ''}
       </div>
     </div>
     <div class="conv-card-body" style="display:${defaultOpen ? 'block' : 'none'}">

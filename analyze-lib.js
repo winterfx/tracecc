@@ -15,10 +15,10 @@ import fs from 'fs';
 
 const sum = (arr) => arr.reduce((a, b) => a + b, 0);
 const avg = (arr) => (arr.length ? sum(arr) / arr.length : 0);
-const pct = (n, d) => (d > 0 ? ((n / d) * 100).toFixed(1) + '%' : 'N/A');
-const pctNum = (n, d) => (d > 0 ? parseFloat(((n / d) * 100).toFixed(1)) : 0);
-const fmtCost = (n) => '$' + n.toFixed(6);
-const fmtSec = (n) => n.toFixed(2) + 's';
+const formatPercent = (n, d) => (d > 0 ? ((n / d) * 100).toFixed(1) + '%' : 'N/A');
+const percentValue = (n, d) => (d > 0 ? parseFloat(((n / d) * 100).toFixed(1)) : 0);
+const formatCost = (n) => '$' + n.toFixed(6);
+const formatSeconds = (n) => n.toFixed(2) + 's';
 
 // ─── Extract usage from SSE body_raw ─────────────────────────────────────────
 
@@ -54,6 +54,10 @@ export function extractSSEUsage(bodyRaw) {
 
 const CC_TYPES = new Set(['user', 'assistant', 'system', 'file-history-snapshot']);
 
+/**
+ * Detect whether JSONL entries are proxy-captured (request/response pairs)
+ * or Claude Code native format (user/assistant messages with metadata).
+ */
 export function detectFormat(entries) {
   for (const e of entries) {
     if (e.request && e.response) return 'proxy';
@@ -64,8 +68,13 @@ export function detectFormat(entries) {
 
 // ─── Convert Claude Code JSONL entries to proxy format ──────────────────────
 
+/**
+ * Convert Claude Code native JSONL entries into proxy-like format.
+ * Reconstructs the growing message context that would appear in API requests,
+ * preserving CC-specific metadata (_ccIsSidechain, _ccUuid, etc.) for
+ * conversation tree building.
+ */
 export function convertCCEntries(ccEntries) {
-  // Filter to meaningful messages only
   const messages = ccEntries.filter(e =>
     (e.type === 'user' || e.type === 'assistant') && !e.isMeta
   );
@@ -233,9 +242,9 @@ export function parseLogFiles(filePaths) {
       ephemeral1h,
       outputTokens,
       totalInput,
-      cost: parseFloat(respHeaders['x-litellm-response-cost-original'] || '0'),
-      costDiscount: parseFloat(respHeaders['x-litellm-response-cost-discount-amount'] || '0'),
-      keySpend: parseFloat(respHeaders['x-litellm-key-spend'] || '0'),
+      cost: parseFloat(respHeaders['x-litellm-response-cost-original'] || '0') || 0,
+      costDiscount: parseFloat(respHeaders['x-litellm-response-cost-discount-amount'] || '0') || 0,
+      keySpend: parseFloat(respHeaders['x-litellm-key-spend'] || '0') || 0,
       messageCount: Array.isArray(reqBody.messages) ? reqBody.messages.length : 0,
     };
   });
@@ -308,19 +317,23 @@ export function computeAnalysis(records, filePaths) {
   };
 
   // ─── 4. Cache Performance ────────────────────────────────────────────────
-  const cacheRecords = records.filter((r) => r.totalInput > 0);
-  const perRequestCache = cacheRecords.map((r, i) => ({
-    index: i + 1,
-    model: r.model,
-    cacheRead: r.cacheRead,
-    totalInput: r.totalInput,
-    hitRate: pctNum(r.cacheRead, r.totalInput),
-  }));
+  const perRequestCache = [];
+  records.forEach((r, i) => {
+    if (r.totalInput > 0) {
+      perRequestCache.push({
+        index: i + 1,
+        model: r.model,
+        cacheRead: r.cacheRead,
+        totalInput: r.totalInput,
+        hitRate: percentValue(r.cacheRead, r.totalInput),
+      });
+    }
+  });
 
   const cache = {
-    hitRate: pctNum(totalCacheRead, grandTotalInput),
-    creationRate: pctNum(totalCacheCreation, grandTotalInput),
-    nonCacheRate: pctNum(totalInputTokens, grandTotalInput),
+    hitRate: percentValue(totalCacheRead, grandTotalInput),
+    creationRate: percentValue(totalCacheCreation, grandTotalInput),
+    nonCacheRate: percentValue(totalInputTokens, grandTotalInput),
     ephemeral5mTokens: totalEph5m,
     ephemeral1hTokens: totalEph1h,
     perRequest: perRequestCache,
@@ -335,11 +348,11 @@ export function computeAnalysis(records, filePaths) {
 
   const requestEfficiency = {
     totalRequests: records.length,
-    success: { count: successCount, pct: pctNum(successCount, records.length) },
-    errors: { count: errorCount, pct: pctNum(errorCount, records.length) },
-    withTools: { count: toolCount, pct: pctNum(toolCount, records.length) },
-    withThinking: { count: thinkingCount, pct: pctNum(thinkingCount, records.length) },
-    streaming: { count: streamCount, pct: pctNum(streamCount, records.length) },
+    success: { count: successCount, pct: percentValue(successCount, records.length) },
+    errors: { count: errorCount, pct: percentValue(errorCount, records.length) },
+    withTools: { count: toolCount, pct: percentValue(toolCount, records.length) },
+    withThinking: { count: thinkingCount, pct: percentValue(thinkingCount, records.length) },
+    streaming: { count: streamCount, pct: percentValue(streamCount, records.length) },
   };
 
   // ─── 6. Latency ──────────────────────────────────────────────────────────
@@ -390,18 +403,17 @@ export function computeAnalysis(records, filePaths) {
     p50: ttftValues.length > 0 ? parseFloat(ttftValues[Math.floor(ttftValues.length * 0.5)].toFixed(3)) : 0,
     p99: ttftValues.length > 0 ? parseFloat(ttftValues[Math.floor(ttftValues.length * 0.99)].toFixed(3)) : 0,
     byModel: ttftByModel,
-    perRequest: records.filter((r) => r.ttft > 0).map((r, i) => ({
-      index: i + 1,
-      model: r.model,
-      ttft: parseFloat(r.ttft.toFixed(3)),
-    })),
+    perRequest: records.reduce((acc, r, i) => {
+      if (r.ttft > 0) acc.push({ index: i + 1, model: r.model, ttft: parseFloat(r.ttft.toFixed(3)) });
+      return acc;
+    }, []),
   };
 
   // ─── 7. Model Selection ──────────────────────────────────────────────────
   const modelSelection = Object.entries(modelGroups).map(([model, recs]) => ({
     model,
     requests: recs.length,
-    share: pctNum(recs.length, records.length),
+    share: percentValue(recs.length, records.length),
     totalTokens: sum(recs.map((r) => r.totalInput + r.outputTokens)),
   }));
 
@@ -419,7 +431,7 @@ export function computeAnalysis(records, filePaths) {
       ? contextRecords[contextRecords.length - 1].totalInput - contextRecords[0].totalInput
       : 0,
     growthPct: contextRecords.length > 1
-      ? pctNum(
+      ? percentValue(
           contextRecords[contextRecords.length - 1].totalInput - contextRecords[0].totalInput,
           contextRecords[0].totalInput,
         )
